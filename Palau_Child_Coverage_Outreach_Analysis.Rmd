@@ -1,0 +1,3829 @@
+---
+title: "Palau Child Coverage and Outreach Planning"
+author: "Report provided by: USAPI Assessment Team | Surveillance & Epidemiology Branch | ISD | NCIRD | CDC"
+date: "Generated on `r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    number_sections: false
+    df_print: paged
+    css: www/styles.css
+  pdf_document: default
+  word_document: default
+editor_options: 
+  chunk_output_type: console
+  markdown: 
+    wrap: 72
+---
+This is the data wrangling, cleaning, and analytic code.
+
+# Install and call required packages
+
+STEP 1: Make a list of packages required to run code/reports
+
+STEP 2: Use a function to install/call on packages if they are not
+already installed/called on
+
+```{r install and call on packages, include=FALSE}
+
+# Run install_packages.R once before the first analysis. This report deliberately
+# does not install packages while handling patient data.
+packages <- c(
+  "here", "rio", "janitor", "dplyr", "tidyr", "stringr", "purrr", "readr",
+  "tibble", "lubridate", "readxl", "writexl", "openxlsx"
+)
+
+missing_packages <- packages[
+  !vapply(packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing R packages: ", paste(missing_packages, collapse = ", "),
+    ". Run install_packages.R and restart R before knitting."
+  )
+}
+
+invisible(lapply(packages, library, character.only = TRUE))
+
+
+```
+
+# Set up directory and visualization settings
+
+```{r setup, include=FALSE}
+
+# -------------------------------------------------------------------
+# Project directories
+# here::here() automatically identifies the Git repository root
+# -------------------------------------------------------------------
+
+project_dir <- here::here()
+
+data_dir <- here::here("data")
+
+raw_data_dir <- here::here(
+  "data",
+  "Raw Patient Data"
+)
+
+output_dir <- here::here(
+  "data",
+  "Analytic Code Output"
+)
+
+# Create the output directory if it does not already exist
+dir.create(
+  output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+# Optional QA
+here::dr_here()
+
+```
+
+## Input files
+```{r input files, include=FALSE}
+# -------------------------------------------------------------------
+# Input files
+# The most recently modified matching WebIZ report is selected.
+# -------------------------------------------------------------------
+
+find_latest_report <- function(pattern, description) {
+  candidates <- list.files(
+    raw_data_dir,
+    pattern = pattern,
+    full.names = TRUE,
+    ignore.case = TRUE
+  )
+
+  if (length(candidates) == 0) {
+    stop(
+      "No ", description, " report was found in ", raw_data_dir,
+      ". Expected a filename matching: ", pattern
+    )
+  }
+
+  candidates[[which.max(file.info(candidates)$mtime)]]
+}
+
+roster_file <- find_latest_report("^Roster.*\\.xlsx$", "roster")
+detail_file <- find_latest_report("^Details.*\\.xlsx$", "patient detail")
+reminder_file <- find_latest_report("^RR.*\\.xlsx$", "reminder/recall")
+
+# Palau county coordinates, 2020 population, land area, and density.
+palau_geo_file <- file.path(
+  data_dir,
+  "Palau_State_Population_Area_Density_2020.xlsx"
+)
+
+# Verify that all required files exist
+required_input_files <- c(
+  roster_file,
+  detail_file,
+  reminder_file,
+  palau_geo_file
+)
+
+missing_input_files <- required_input_files[
+  !file.exists(required_input_files)
+]
+
+if (length(missing_input_files) > 0) {
+  stop(
+    paste0(
+      "The following required input files were not found:\n",
+      paste(missing_input_files, collapse = "\n")
+    )
+  )
+}
+```
+
+# Import data from WebIZ
+
+STEP 1: Import Patient Roster
+
+STEP 2: Import Patient Detail with Services
+
+STEP 3: Import Reminder/Recall
+
+
+```{r import data, include=FALSE}
+
+# Import roster
+roster <- rio::import(roster_file) %>%
+  janitor::clean_names()
+
+# Import patient detail with services
+detail <- rio::import(detail_file) %>%
+  janitor::clean_names()
+
+# Import reminder/recall
+reminder <- rio::import(reminder_file) %>%
+  janitor::clean_names()
+
+# Import the Palau county workbook created for this project.
+palau_county_raw <- readxl::read_excel(
+  palau_geo_file,
+  sheet = "State_Data"
+) %>%
+  janitor::clean_names()
+
+# Palau WebIZ does not provide a usable sub-county geography. Keep a blank
+# compatibility field for source reports that omit `city`.
+if (!"city" %in% names(roster)) {
+  roster$city <- NA_character_
+}
+if (!"city" %in% names(reminder)) {
+  reminder$city <- NA_character_
+}
+
+```
+
+# Clean patient roster
+
+STEP 1: Create a flag indicator for patients on the roster - this is
+useful later when merged with the patient detail to indicate who is on
+the roster. We later only retain children active on the roster.
+
+STEP 2: Create a calculated variable for age in years and age in months.
+
+IMPORTANT! Make sure the "age as of" date matches your intended date,
+the same you used to the reports out of WebIZ.
+
+STEP 3: Create age groups - depending on what you need
+
+STEP 4: Filter (remove) anyone who is not in the age group(s) of
+interest.
+
+## !!!! UPDATE AS OF DATE AS NEEDED !!!!
+
+```{r clean roster, include=FALSE}
+
+#Set the "age as of" date. For example, age 19 - 35 months *as of January 1, 2026*
+
+age_as_of_date <- ymd("2026-04-01")
+
+roster2 <- roster %>% 
+  mutate(
+    roster = 1,   # Step 1: Create a "flag" for if the child is on the roster
+    
+    # Step 2: "Parse" DOB, calculate age in months, and age in years
+    age_months = floor(time_length(interval(dob, age_as_of_date), "months")),
+    age_years  = floor(time_length(interval(dob, age_as_of_date), "years")),
+    
+# Step 3: Assign age group - first date is the DOB of the oldest kid in the cohort, second date is the DOB of the youngest kid in the cohort. Use the same DOB range you used to run the patient detail with services.
+
+    agegroup = case_when(
+      age_months >= 2 & age_months < 4 ~ 1,
+      age_months >= 4 & age_months < 6 ~ 2,
+      age_months >= 6 & age_months < 12 ~ 3,
+      age_months >= 12 & age_months < 19 ~ 4,
+      age_months >= 19 & age_months < 36 ~ 5,
+      age_months >= 36 & age_months < 48 ~ 6,
+      age_months >= 48 & age_months < 60 ~ 7,
+      age_months >= 60 & age_months < 72 ~ 8,
+      age_months >= 72 & age_months < 84 ~ 9,
+      TRUE ~ NA_integer_)
+  )%>% 
+  
+  # Step 4: Filter out those not in the age group(s) of interest
+  filter(!is.na(agegroup))
+
+```
+
+QA roster
+
+```{r roster2 qa, include=FALSE}
+
+#qa to ensure agegroup, age_years, and age_months was created properly and that ages are in preferred age group only
+
+print(roster2)
+colnames(roster2)
+
+roster2 %>% 
+  count(agegroup) 
+
+roster2 %>% 
+  count(age_years)
+
+roster2 %>% 
+  count(age_months)
+
+roster2 %>% 
+  count(county)
+n_distinct(roster2$county)
+sort(unique(roster2$county))
+```
+
+# Clean patient reminder/recall
+
+STEP 1: Create a flag indicator for patients on the reminder.
+
+STEP 2: Create a calculated variable for age in years and age in months.
+
+IMPORTANT! Make sure the "age as of" date matches your intended date,
+the same you used to the reports out of WebIZ.
+
+STEP 3: Create age groups - depending on what you need.
+
+STEP 4: Filter (remove) anyone who is not in the age group(s) of
+interest.
+
+## !!!! UPDATE AS OF DATE AS NEEDED !!!!
+
+```{r reminder2, include=FALSE}
+#Set the "age as of" date. For example, age 19 - 35 months *as of January 1, 2026*
+
+age_as_of_date <- ymd("2026-04-01")
+
+reminder2 <- reminder %>% 
+  mutate(
+    onreminder = 1,   # Step 1: Create a "flag" for if the child is on the roster
+    
+    # Step 2: "Parse" DOB, calculate age in months, and age in years
+    age_months = floor(time_length(interval(dob, age_as_of_date), "months")),
+    age_years  = floor(time_length(interval(dob, age_as_of_date), "years")),
+    
+# Step 3: Assign age group - first date is the DOB of the oldest kid in the cohort, second date is the DOB of the youngest kid in the cohort. Use the same DOB range you used to run the patient detail with services.
+
+#In this case, creating age groups for 2 - 59 months (note there is a 19-35 month catgeory)
+
+    rr_agegroup = case_when(
+      age_months >= 2 & age_months < 4 ~ 1,
+      age_months >= 4 & age_months < 6 ~ 2,
+      age_months >= 6 & age_months < 12 ~ 3,
+      age_months >= 12 & age_months < 19 ~ 4,
+      age_months >= 19 & age_months < 36 ~ 5,
+      age_months >= 36 & age_months < 48 ~ 6,
+      age_months >= 48 & age_months < 60 ~ 7,
+      age_months >= 60 & age_months < 72 ~ 8,
+      age_months >= 72 & age_months < 84 ~ 9,
+      TRUE ~ NA_integer_)
+  )%>% 
+  
+  #Rename county to rr_county so that we can retain the patient roster county and the reminder/recall county in the final dataset (because they are often different and we can use both for better cleaning)
+  
+  mutate(county = toupper(county)) %>%
+  rename(rr_county = county) %>%
+
+  # Step 4: Filter out those not in the age group(s) of interest
+  filter(!is.na(rr_agegroup))
+
+
+```
+
+QA
+```{r}
+reminder2 %>% 
+  count(rr_agegroup) 
+
+```
+
+# Create reminder categories
+
+STEP 1: Parse out vaccine types
+
+STEP 2: Detepalaune whether the dose is considered "final" based on age
+
+STEP 3: Create categorizations for delinquency according to the
+recommended schedule
+
+```{r recs, include=FALSE}
+
+reminder3 <- reminder2 %>%
+  # Keep only children 2-83 months
+  filter(age_months >= 2, age_months < 84) %>%
+  # Temporary row ID so we can safely collapse back later
+  mutate(row_id = row_number())
+
+# --- Step A: Parse recommendations into one row per recommended dose ---
+processed_doses <- reminder3 %>%
+  select(row_id, patient_id, age_months, immunization_recommendations) %>%
+  mutate(
+    matches = str_extract_all(
+      immunization_recommendations,
+      regex("(DTAP|HEPB|HIB|MMR/MEASLES|PNEUMOCOCCAL|POLIO)\\s*\\(\\d+\\)", ignore_case = TRUE)
+    )
+  ) %>%
+  unnest(matches) %>%
+  mutate(
+    vaccine = str_to_upper(str_extract(matches, "^[A-Z/]+")),
+    dose    = as.numeric(str_extract(matches, "\\d+"))
+  ) %>%
+  # Ignore HepB(4)
+  filter(!(vaccine == "HEPB" & dose == 4)) %>%
+  
+  # --- Step B: Flag whether each recommended dose is a "final dose" for that age ---
+  mutate(
+    is_final = case_when(
+      
+      # 2-3 months: 1 DTaP, 1 IPV, 1 Hib, 2 HepB, 1 PCV
+      age_months >= 2 & age_months <= 3 ~ case_when(
+        vaccine == "DTAP"         & dose == 1 ~ 1,
+        vaccine == "POLIO"        & dose == 1 ~ 1,
+        vaccine == "HIB"          & dose == 1 ~ 1,
+        vaccine == "HEPB"         & dose == 2 ~ 1,
+        vaccine == "PNEUMOCOCCAL" & dose == 1 ~ 1,
+        TRUE ~ 0
+      ),
+      
+      # 4-5 months: 2 DTaP, 2 IPV, 2 Hib, 2 HepB, 2 PCV
+      age_months >= 4 & age_months <= 5 ~ case_when(
+        vaccine == "DTAP"         & dose == 2 ~ 1,
+        vaccine == "POLIO"        & dose == 2 ~ 1,
+        vaccine == "HIB"          & dose == 2 ~ 1,
+        vaccine == "HEPB"         & dose == 2 ~ 1,
+        vaccine == "PNEUMOCOCCAL" & dose == 2 ~ 1,
+        TRUE ~ 0
+      ),
+      
+      # 6-11 months: 3 DTaP, 3 IPV, 2 Hib, 3 HepB, 3 PCV
+      age_months >= 6 & age_months <= 11 ~ case_when(
+        vaccine == "DTAP"         & dose == 3 ~ 1,
+        vaccine == "POLIO"        & dose == 3 ~ 1,
+        vaccine == "HIB"          & dose == 2 ~ 1,
+        vaccine == "HEPB"         & dose == 3 ~ 1,
+        vaccine == "PNEUMOCOCCAL" & dose == 3 ~ 1,
+        TRUE ~ 0
+      ),
+      
+      # 12-18 months: 4 DTaP, 3 IPV, 1 MMR, 3 Hib, 3 HepB, 4 PCV
+      age_months >= 12 & age_months <= 18 ~ case_when(
+        vaccine == "DTAP"         & dose == 4 ~ 1,
+        vaccine == "POLIO"        & dose == 3 ~ 1,
+        vaccine == "MMR/MEASLES"  & dose == 1 ~ 1,
+        vaccine == "HIB"          & dose == 3 ~ 1,
+        vaccine == "HEPB"         & dose == 3 ~ 1,
+        vaccine == "PNEUMOCOCCAL" & dose == 4 ~ 1,
+        TRUE ~ 0
+      ),
+      
+      # 19-47 months: 4 DTaP, 3 IPV, 2 MMR, Hib(any), 3 HepB, PCV(any)
+      age_months >= 19 & age_months <= 47 ~ case_when(
+        vaccine == "DTAP"         & dose == 4 ~ 1,
+        vaccine == "POLIO"        & dose == 3 ~ 1,
+        vaccine == "MMR/MEASLES"  & dose == 2 ~ 1,
+        vaccine == "HIB"                    ~ 1,
+        vaccine == "HEPB"         & dose == 3 ~ 1,
+        vaccine == "PNEUMOCOCCAL"           ~ 1,
+        TRUE ~ 0
+      ),
+      
+      # 48-83 months: 4 or 5 DTaP, 4 or 3 IPV, 2 MMR, Hib(any), 3 HepB, PCV(any)
+      age_months >= 48 & age_months <= 83 ~ case_when(
+        vaccine == "DTAP"         & dose %in% c(4, 5) ~ 1,
+        vaccine == "POLIO"        & dose %in% c(3, 4) ~ 1,
+        vaccine == "MMR/MEASLES"  & dose == 2         ~ 1,
+        vaccine == "HIB"                              ~ 1,
+        vaccine == "HEPB"         & dose == 3         ~ 1,
+        vaccine == "PNEUMOCOCCAL"                     ~ 1,
+        TRUE ~ 0
+      ),
+      
+      TRUE ~ 0
+    )
+  )
+
+# --- Step C: Count final vs nonfinal recommended doses ---
+dose_counts <- processed_doses %>%
+  group_by(row_id) %>%
+  summarise(
+    final_count    = sum(is_final == 1, na.rm = TRUE),
+    nonfinal_count = sum(is_final == 0, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# --- Step D: Join back and classify how far behind the child is ---
+reminder3 <- reminder3 %>%
+  left_join(dose_counts, by = "row_id") %>%
+  mutate(
+    final_count    = replace_na(final_count, 0),
+    nonfinal_count = replace_na(nonfinal_count, 0),
+
+    RR_category = case_when(
+      final_count == 0 & nonfinal_count == 0 ~ 99,
+      nonfinal_count > 0                     ~ 3,  # Missing more than a final dose
+      final_count == 1                       ~ 1,  # Missing only 1 final dose
+      final_count >= 2                       ~ 2,  # Missing 2+ final doses
+      TRUE                                   ~ 99
+    ),
+
+    rr_subcategory = case_when(
+      RR_category == 99 ~ "No recommendations after filters",
+      RR_category == 3  ~ "Missing more than a final dose",
+      RR_category == 1  ~ "Missing only 1 final dose",
+      RR_category == 2  ~ "Missing 2 or more final doses"
+    ),
+
+    rr_miss_cat = case_when(
+      RR_category == 99 ~ "No recommendations",
+      RR_category == 3  ~ "2) Missing more than a final dose",
+      RR_category == 1  ~ "1a) Missing only 1 final dose",
+      RR_category == 2  ~ "1b) Missing 2 or more final doses"
+    ),
+
+    age_band = case_when(
+      age_months >= 2  & age_months <= 3  ~ "2-3 months",
+      age_months >= 4  & age_months <= 5  ~ "4-5 months",
+      age_months >= 6  & age_months <= 11 ~ "6-11 months",
+      age_months >= 12 & age_months <= 18 ~ "12-18 months",
+      age_months >= 19 & age_months <= 47 ~ "19-47 months",
+      age_months >= 48 & age_months <= 59 ~ "48-59 months",
+      age_months >= 60 & age_months <= 71 ~ "60-71 months",
+      age_months >= 72 & age_months <= 83 ~ "72-83 months",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  select(
+    patient_id, primary_contact_lastname_firstname, age_months, onreminder, rr_county,
+    address_line_1, address_line_2, city, state, zip,
+    immunization_recommendations,
+    final_count, nonfinal_count,
+    RR_category, rr_subcategory
+  )
+
+# Preview
+head(reminder3)
+
+```
+
+# Determine which vaccine types are needed based on reminder/recall
+
+Determine specific product types per child based on recommendations
+
+```{r recs2, include=FALSE}
+
+#Determine which vaccines are needed based on the reminder
+
+reminder4 <- reminder3 %>%
+  mutate(
+    
+    # --- Basic vaccine recommendation flags ---
+    
+    # MMR IS DONE LATER BECAUSE DOSE 2 FOR CHILDREN UNDER 4 AREN'T ON RR
+    
+    need_dtap = str_detect(immunization_recommendations,
+                           regex("DTAP\\s*\\(", ignore_case = TRUE)),
+    
+    need_dtap123 = str_detect(immunization_recommendations,
+                           regex("DTAP\\s*\\((1|2|3)\\)", ignore_case = TRUE)),
+    
+    need_hepb = str_detect(immunization_recommendations,
+                           regex("HEPB\\s*\\(", ignore_case = TRUE)),
+    
+    need_ipv = str_detect(immunization_recommendations,
+                          regex("POLIO\\s*\\(", ignore_case = TRUE)),
+    
+    need_ipv123 = str_detect(immunization_recommendations,
+                             regex("POLIO\\s*\\((1|2|3)\\)", ignore_case = TRUE)),
+    
+    need_hib = str_detect(immunization_recommendations,
+                          regex("HIB\\s*\\(", ignore_case = TRUE)),
+    
+    need_hib4 = str_detect(immunization_recommendations,
+                           regex("HIB\\s*\\(4\\)", ignore_case = TRUE)),
+    
+    need_hib123 = str_detect(immunization_recommendations,
+                             regex("HIB\\s*\\((1|2|3)\\)", ignore_case = TRUE)),
+    
+    need_pcv = str_detect(immunization_recommendations,
+                          regex("PNEUMOCOCCAL\\s*\\(", ignore_case = TRUE)),
+    
+    need_rota = str_detect(immunization_recommendations,
+                           regex("ROTAVIRUS\\s*\\(", ignore_case = TRUE)),
+    
+    # --- Product indicators ---
+      vaxelis_antigen_count =
+      as.integer(need_dtap123) +
+      as.integer(need_ipv123) +
+      as.integer(need_hib123) +
+      as.integer(need_hepb),
+
+    pediarix_antigen_count =
+      as.integer(need_dtap123) +
+      as.integer(need_ipv123) +
+      as.integer(need_hepb),
+    
+  # --- Product indicators (Yes/No) ---
+
+Vaxelis = if_else(
+  need_hib123 & vaxelis_antigen_count >= 2 &
+    !(need_hib123 & !need_dtap & !need_ipv & !need_hepb),
+  1, 0
+),
+
+Pediarix = if_else(
+  (need_hib4 | !need_hib) &
+    pediarix_antigen_count >= 2 &
+    Vaxelis == 0,
+  1, 0
+),
+
+   PedVaxHib = if_else(
+  need_hib4 |
+    (need_hib123 & Vaxelis == 0 & Pediarix == 0),
+  1, 0
+),
+
+DTaP_Single = if_else(
+  need_dtap & Vaxelis == 0 & Pediarix == 0,
+  1, 0
+),
+
+IPV_Single = if_else(
+  need_ipv & Vaxelis == 0 & Pediarix == 0,
+  1, 0
+),
+
+    Prevnar    = if_else(need_pcv, 1,0),
+    RotaTeq    = if_else(need_rota, 1,0)
+  ) %>%
+  select(-vaxelis_antigen_count, -pediarix_antigen_count)
+
+# Preview
+head(reminder4)
+
+```
+
+# Clean the patient details with services report
+
+STEP 1: Create a flag indicator for patients on the detail - this is
+useful later when merged with the patient roster to indicate who is on
+the detail.
+
+STEP 2: Create a calculated variable for age in years and age in months.
+
+IMPORTANT! Make sure the "age as of" date matches your intended date,
+the same you used to the reports out of WebIZ.
+
+STEP 3: Create age groups - depending on what you need.
+
+STEP 4: Filter (remove) anyone who is not in the age group(s) of
+interest.
+
+## !!!! UPDATE AS OF DATE AS NEEDED !!!!
+
+```{r clean detail, include=FALSE}
+
+age_as_of_date <- ymd("2026-04-01")
+
+detail2 <-detail %>% 
+  mutate(
+    detail = 1,   # Step 1: Create a "flag" for if the patient is on the detail
+    
+    # Step 2: parse DOB and calculate age
+    #dob = mdy(dob),
+    age_months = floor(time_length(interval(dob, age_as_of_date), "months")),
+    age_years  = floor(time_length(interval(dob, age_as_of_date), "years")),
+    
+    # Step 3: assign age group
+     agegroup = case_when(
+      age_months >= 2 & age_months < 4 ~ 1,
+      age_months >= 4 & age_months < 6 ~ 2,
+      age_months >= 6 & age_months < 12 ~ 3,
+      age_months >= 12 & age_months < 19 ~ 4,
+      age_months >= 19 & age_months < 36 ~ 5,
+      age_months >= 36 & age_months < 48 ~ 6,
+      age_months >= 48 & age_months < 60 ~ 7,
+      age_months >= 60 & age_months < 72 ~ 8,
+      age_months >= 72 & age_months < 84 ~ 9,
+      TRUE ~ NA_integer_)
+  )%>% 
+  
+  # Step 4: filter out those not in age group(s) of interest
+  filter(!is.na(agegroup))
+
+```
+
+QA detail report
+
+```{r detail2 qa, include=FALSE}
+
+#qa to ensure agegroup was created properly
+print(detail2)
+colnames(detail2)
+
+detail2 %>% 
+  count(agegroup)
+```
+
+# Transpose vaccine data
+
+STEP 1: Transpose vaccine data using CVX codes. This transposes the
+patient detail list using vaccination_code_id to get one line per
+patient with all vaccine history.
+
+Step 2: Filter data to only include the selected vaccine types (e.g.,
+DTaP) using the all relevant cvx code(s) that include that vaccine type.
+
+Step 3: Select needed variables
+
+Step 4: Group by patient name
+
+Step 5: Create row identifier to distinguishing multiple vaccination
+dates for patients who may have received more than one dose.
+
+Step 6: Reshape data from the default long format to a wide format -
+putting all the vaccine dates for an individual patient record one line.
+
+NOTE 1: Vaccines included: BCG, DTaP, IPV, MMR, Hib, HepB, PCV, Rota
+
+NOTE 2: Check CVX codes for each vaccine to make sure none are missing
+or added to the wrong vaccine
+
+NOTE 3: Calculating the number of doses by antigen will be completed
+later
+
+```{r transpose vaccine data, include=FALSE}
+
+# STEP 1 transpose vaccine data using cvx codes. This transposes the patient detail list using vaccination_code_id to get one line per patient with all vaccine history. 
+################## BCG ##################
+bcg <- detail2 %>% 
+    # filter data to only include selected vaccine using the correct cvx code(s)
+    filter(vaccination_code_id == "19") %>% 
+    # select needed variables
+    select (patient_name, gender, vaccination_date) %>% 
+    # group by patient name
+    group_by(patient_name) %>% 
+    # create row identifier to distinguishing multiple vaccination dates for patients who may have received more than one dose.
+    mutate(row_id = row_number()) %>% 
+    # reshape data from the default long format to a wide format 
+    pivot_wider(id_cols = c(patient_name, gender), names_from = row_id, values_from = vaccination_date, names_prefix= "bcg_date") 
+
+################## DTAP ##################
+dtap <- detail2 %>% 
+    # filter data to only include selected vaccine using the correct cvx code(s)
+    filter(vaccination_code_id %in% c("1","20","22","28","50","102","106","107","110","120","130","132","146","170","198")) %>%
+    # select needed variables
+    select (patient_name, gender, vaccination_date) %>% 
+    # group by patient name
+    group_by(patient_name) %>% 
+    # create row identifier to distinguishing multiple vaccination dates for patients who may have received more than one dose.
+    mutate(row_id = row_number()) %>% 
+    # reshape data from the default long format to a wide format 
+    pivot_wider(id_cols = c(patient_name, gender), names_from = row_id, values_from = vaccination_date, names_prefix= "dtap_date")
+
+################## IPV ##################
+ipv <- detail2 %>% 
+    # filter data to only include selected vaccine using the correct cvx code(s)
+    filter(vaccination_code_id %in% c("2","10","89","110","120","130","132","146","170","178","179","182","195")) %>%
+    # select needed variables
+    select (patient_name, gender, vaccination_date) %>% 
+    # group by patient name
+    group_by(patient_name) %>% 
+    # create row identifier to distinguishing multiple vaccination dates for patients who may have received more than one dose.
+    mutate(row_id = row_number()) %>% 
+    # reshape data from the default long format to a wide format 
+    pivot_wider(id_cols = c(patient_name, gender), names_from = row_id, values_from = vaccination_date, names_prefix= "ipv_date")
+
+################## MMR ##################
+mmr <- detail2 %>% 
+    # filter data to only include selected vaccine using the correct cvx code(s)
+    filter(vaccination_code_id %in% c("3","94")) %>%
+    # select needed variables
+    select (patient_name, gender, vaccination_date) %>% 
+    # group by patient name
+    group_by(patient_name) %>% 
+    # create row identifier to distinguishing multiple vaccination dates for patients who may have received more than one dose.
+    mutate(row_id = row_number()) %>% 
+    # reshape data from the default long format to a wide format 
+    pivot_wider(id_cols = c(patient_name, gender), names_from = row_id, values_from = vaccination_date, names_prefix= "mmr_date")
+
+################## HEPB ##################
+hepb <- detail2 %>% 
+    # filter data to only include selected vaccine using the correct cvx code(s)
+    filter(vaccination_code_id %in% c("8","42","43","44","45","51","102","104","110","132","146","189","193","198","220")) %>%
+    # select needed variables
+    select (patient_name, gender, vaccination_date) %>% 
+    # group by patient name
+    group_by(patient_name) %>% 
+    # create row identifier to distinguishing multiple vaccination dates for patients who may have received more than one dose.
+    mutate(row_id = row_number()) %>% 
+    # reshape data from the default long format to a wide format 
+    pivot_wider(id_cols = c(patient_name, gender), names_from = row_id, values_from = vaccination_date, names_prefix= "hepb_date")
+
+################## PCV ##################
+pcv <- detail2 %>% 
+    # filter data to only include selected vaccine using the correct cvx code(s)
+    filter(vaccination_code_id %in% c("33","100","109","133","152","177","215","216")) %>%
+    # select needed variables
+    select (patient_name, gender, vaccination_date) %>% 
+    # group by patient name
+    group_by(patient_name) %>% 
+    # create row identifier to distinguishing multiple vaccination dates for patients who may have received more than one dose.
+    mutate(row_id = row_number()) %>% 
+    # reshape data from the default long format to a wide format 
+    pivot_wider(id_cols = c(patient_name, gender), names_from = row_id, values_from = vaccination_date, names_prefix= "pcv_date")
+
+################## HIB ##################
+hib <- detail2 %>% 
+    # filter data to only include selected vaccine using the correct cvx code(s)
+    filter(vaccination_code_id %in% c("17","22","46","47","48","49","50","51","102","120","132","146","148","170","198")) %>%
+    # select needed variables
+    select (patient_name, gender, vaccination_date) %>% 
+    # group by patient name
+    group_by(patient_name) %>% 
+    # create row identifier to distinguishing multiple vaccination dates for patients who may have received more than one dose.
+    mutate(row_id = row_number()) %>% 
+    # reshape data from the default long format to a wide format 
+    pivot_wider(id_cols = c(patient_name, gender), names_from = row_id, values_from = vaccination_date, names_prefix= "hib_date")
+
+
+########################################### SPECIAL ROTA ##################
+#Rotarix: 2-dose series at age 2 and 4 months
+#Rotateq: 3-dose series at age 2, 4, and 6 months
+#if any dose in the series is either rotateq® or unknown, default to 3-dose series.
+
+################## ANY ROTA PRODUCT ##################
+rota <- detail2 %>% 
+    # filter data to only include selected vaccine using the correct cvx code(s)
+    filter(vaccination_code_id %in% c("74","116","119","122")) %>%
+    # select needed variables
+    select (patient_name, gender, vaccination_date) %>% 
+    # group by patient name
+    group_by(patient_name) %>% 
+    # create row identifier to distinguishing multiple vaccination dates for patients who may have received more than one dose.
+    mutate(row_id = row_number()) %>% 
+    # reshape data from the default long format to a wide format 
+    pivot_wider(id_cols = c(patient_name, gender), names_from = row_id, values_from = vaccination_date, names_prefix= "rota_date")
+
+################## ROTA TWO DOSE PRODUCT ##################
+rota_2d <- detail2 %>% 
+    # filter data to only include selected vaccine using the correct cvx code(s)
+    filter(vaccination_code_id %in% c("119")) %>%
+    # select needed variables
+    select (patient_name, gender, vaccination_date) %>% 
+    # group by patient name
+    group_by(patient_name) %>% 
+    # create row identifier to distinguishing multiple vaccination dates for patients who may have received more than one dose.
+    mutate(row_id = row_number()) %>% 
+    # reshape data from the default long format to a wide format
+    pivot_wider(id_cols = c(patient_name, gender), names_from = row_id, values_from = vaccination_date, names_prefix= "rota_2d_date")
+
+################## ROTA THREE DOSE ##################
+rota_3d <- detail2 %>% 
+    # filter data to only include selected vaccine using the correct cvx code(s)
+    filter(vaccination_code_id %in% c("74","116","122")) %>%
+    # select needed variables
+    select (patient_name, gender, vaccination_date) %>% 
+    # group by patient name
+    group_by(patient_name) %>% 
+    # create row identifier to distinguishing multiple vaccination dates for patients who may have received more than one dose.
+    mutate(row_id = row_number()) %>% 
+    # reshape data from the default long format to a wide format 
+    pivot_wider(id_cols = c(patient_name, gender), names_from = row_id, values_from = vaccination_date, names_prefix= "rota_3d_date")
+
+```
+
+QA transposed data
+
+```{r qa transposed data, include=FALSE}
+#print all for qa
+bcg
+dtap
+ipv
+mmr
+hepb
+pcv
+hib
+rota
+rota_2d
+rota_3d
+ 
+```
+
+# Sort vaccine dose dates
+
+STEP 1: sort vaccine doses in chronological order
+
+Step 2: Select variables to retain
+
+Step 3: Arrange date variables in ascending order, keep previous
+grouping (by patient_name) intact
+
+Step4: Retain all variables in final result
+
+```{r, sorting date variables, include=FALSE}
+
+# STEP 1: Sort vaccine doses in chronological order   
+
+################## BCG ##################
+#sort only the columns starting with "bcg_date" based on their date values while keeping other columns intact
+sorted_bcg <- bcg %>%
+  #select variables
+  select(patient_name, gender, starts_with("bcg_date")) %>%
+  #parse dates in MM-DD-YYYY format
+  #mutate(across(starts_with("bcg_date"), ~ mdy(. , quiet = TRUE))) %>%
+  #arrange date variables in ascending order, keep previous grouping (by patient_name) intact
+  arrange_at(vars(starts_with("bcg_date")), ~ as.Date(.), by_group = TRUE) %>%
+  #retain all variables in final result
+  select(patient_name, gender, everything())
+
+
+################## DTAP ##################
+#sort only the columns starting with "dtap_date" based on their date values while keeping other columns intact
+sorted_dtap <- dtap %>%
+  #select variables
+  select(patient_name, gender, starts_with("dtap_date")) %>%
+  #parse dates in MM-DD-YYYY format
+  #mutate(across(starts_with("dtap_date"), ~ mdy(. , quiet = TRUE))) %>%
+  #arrange date variables in ascending order, keep previous grouping (by patient_name) intact
+  arrange_at(vars(starts_with("dtap_date")), ~ as.Date(.), by_group = TRUE) %>%
+  #retain all variables in final result
+  select(patient_name, gender, everything())
+
+
+################## IPV ##################
+#sort only the columns starting with "ipv_date" based on their date values while keeping other columns intact
+sorted_ipv <- ipv %>%
+  #select variables
+  select(patient_name, gender, starts_with("ipv_date")) %>%
+  #parse dates in MM-DD-YYYY format
+  #mutate(across(starts_with("ipv_date"), ~ mdy(. , quiet = TRUE))) %>%
+  #arrange date variables in ascending order, keep previous grouping (by patient_name) intact
+  arrange_at(vars(starts_with("ipv_date")), ~ as.Date(.), by_group = TRUE) %>%
+  #retain all variables in final result
+  select(patient_name, gender, everything())
+
+
+################## MMR ##################
+#sort only the columns starting with "mmr_date" based on their date values while keeping other columns intact
+sorted_mmr <- mmr %>%
+  #select variables
+  select(patient_name, gender, starts_with("mmr_date")) %>%
+   #parse dates in MM-DD-YYYY format
+  #mutate(across(starts_with("mmr_date"), ~ mdy(. , quiet = TRUE))) %>%
+  #arrange date variables in ascending order, keep previous grouping (by patient_name) intact
+  arrange_at(vars(starts_with("mmr_date")), ~ as.Date(.), by_group = TRUE) %>%
+  #retain all variables in final result
+  select(patient_name, gender, everything())
+
+
+################## HEPB ##################
+#sort only the columns starting with "hepb_date" based on their date values while keeping other columns intact
+sorted_hepb <- hepb %>%
+  #select variables
+  select(patient_name, gender, starts_with("hepb_date")) %>%
+   #parse dates in MM-DD-YYYY format
+  #mutate(across(starts_with("hepb_date"), ~ mdy(. , quiet = TRUE))) %>%
+  #arrange date variables in ascending order, keep previous grouping (by patient_name) intact
+  arrange_at(vars(starts_with("hepb_date")), ~ as.Date(.), by_group = TRUE) %>%
+  #retain all variables in final result
+  select(patient_name, gender, everything())
+
+
+################## PCV ##################
+#sort only the columns starting with "pcv_date" based on their date values while keeping other columns intact
+sorted_pcv <- pcv %>%
+  #select variables
+  select(patient_name, gender, starts_with("pcv_date")) %>%
+   #parse dates in MM-DD-YYYY format
+  #mutate(across(starts_with("pcv_date"), ~ mdy(. , quiet = TRUE))) %>%
+  #arrange date variables in ascending order, keep previous grouping (by patient_name) intact
+  arrange_at(vars(starts_with("pcv_date")), ~ as.Date(.), by_group = TRUE) %>%
+  #retain all variables in final result
+  select(patient_name, gender, everything())
+
+################## HIB ##################
+#sort only the columns starting with "hib_date" based on their date values while keeping other columns intact
+sorted_hib <- hib %>%
+  #select variables
+  select(patient_name, gender, starts_with("hib_date")) %>%
+   #parse dates in MM-DD-YYYY format
+  #mutate(across(starts_with("hib_date"), ~ mdy(. , quiet = TRUE))) %>%
+  #arrange date variables in ascending order, keep previous grouping (by patient_name) intact
+  arrange_at(vars(starts_with("hib_date")), ~ as.Date(.), by_group = TRUE) %>%
+  #retain all variables in final result
+  select(patient_name, gender, everything())
+
+
+########################################### SPECIAL ROTA ###########################
+
+################## ANY ROTA PRODUCT ##################
+#sort only the columns starting with "rota_date" based on their date values while keeping other columns intact
+sorted_rota <- rota %>%
+  #select variables
+  select(patient_name, gender, starts_with("rota_date")) %>%
+  #parse dates in MM-DD-YYYY format
+  #mutate(across(starts_with("rota_date"), ~ mdy(. , quiet = TRUE))) %>%
+  #arrange date variables in ascending order, keep previous grouping (by patient_name) intact
+  arrange_at(vars(starts_with("rota_date")), ~ as.Date(.), by_group = TRUE) %>%
+  #retain all variables in final result
+  select(patient_name, gender, everything())
+
+```
+
+QA sorted data
+
+```{r qa sorted data, include=FALSE}
+#print all for qa
+print(sorted_bcg)
+sorted_dtap
+sorted_ipv
+sorted_mmr
+sorted_hepb
+sorted_pcv
+sorted_hib
+sorted_rota
+
+```
+
+# Merge vaccine data back to single dataset
+
+STEP 1: Create a list of selected, sorted, vaccines
+
+STEP 2: merge vaccine data with full_join, so that the transposed
+vaccine date datasets so there is one line per patient with all of their
+vaccine dates
+
+```{r, merge vaccine data, include=FALSE}
+
+# STEP 1: Create a list object of selected, sorted, vaccines
+vaccine_data <- list(
+                     sorted_bcg
+                    ,sorted_dtap
+                    ,sorted_ipv
+                    ,sorted_mmr
+                    ,sorted_hepb
+                    ,sorted_pcv
+                    ,sorted_hib
+                    ,sorted_rota
+          ) #parenthesis close 
+
+# STEP 2: Merge vaccine data with full_join, so that the transposed vaccine date datasets so there is one line per patient with all of their vaccine dates.
+
+#Reduce applies the function full_join iteratively over the list. It will first merge BCG with DTaP, then add IPV, etc. until all are merged on the unique patient name variable. 
+
+detail3 <- vaccine_data %>% 
+  reduce(full_join, by = c("patient_name", "gender"))
+
+```
+
+QA merged vaccine data
+
+```{r qa merged vaccine data, include=FALSE}
+#print for qa
+print(detail3)
+```
+
+Optional - drop unwanted variables
+
+STEP 1: check column names to see if any can be dropped before analysis
+
+STEP 2: comment name of variables (if any) need to be dropped
+
+STEP 3: drop the unwanted variables with subset
+
+```{r drop unwanted variables, include=FALSE, eval=FALSE}
+###########################################
+#      this code chunk is optional        #
+###########################################
+
+# STEP 1: Check dataset column names to see which vaccine date variables to drop
+colnames(detail3)
+
+
+# STEP 2: Remove unwanted variables (e.g., BCG_DATE2) by sub-setting data
+detail3 <- subset(detail3, select = -c(
+  bcg_date2
+))
+
+
+```
+
+QA dropped variables
+
+```{r qa dropped variables, include=FALSE, eval=FALSE}
+#print column named to check variables were dropped
+colnames(detail3)
+```
+
+# Continue detail manipulation
+
+STEP 1: Create a flag indicator for patients on the patient detail -
+this is useful later when merged with the patient roster to indicate who
+is in the detail
+
+STEP 2: Extract patient id (WebIZ) from the parentheses in the
+patient_name variable, so that it matches the patient roster Patient_ID
+variable
+
+```{r more detail cleaning, include=FALSE}
+
+#Start highlight here
+detail4 <- detail3 %>%
+  mutate(
+    # STEP 1: Create a "flag" variable for the patient detail
+    detail=1,
+    # STEP 2: Extract patient id from the parentheses in patient_name variable
+    patient_id = gsub(".*\\((\\d+)\\).*", "\\1", patient_name),
+    patient_id = gsub("[^0-9]", "", patient_id),
+    ondetail=1
+  ) #mutate close - end highlight
+
+```
+
+QA detail
+
+```{r qa detail4, include=FALSE}
+#print for qa
+detail4
+colnames(detail4)
+detail4$patient_id
+
+```
+
+# JOIN ROSTER2, REMINDER4, AND DETAIL4
+
+Remove patients with missing patient_id
+
+Join roster and detail first, clean, then join reminder
+
+STEP 1: Use full join to merge roster2, reminder4, and detail4, by
+patient id
+
+STEP 2: Complete flags for records missing in roster, detail by making
+the flag 0 if it's missing
+
+STEP 3: Create birth cohort year
+
+STEP 4: Clean gender
+
+STEP 5: Make county uppercase
+
+STEP 6: Subset to only include active patients
+
+```{r merge detail3 and roster2, include=FALSE}
+
+roster2 <- roster2 %>%
+  mutate(patient_id = as.character(patient_id))
+
+reminder4 <- reminder4 %>%
+  mutate(patient_id = as.character(patient_id))
+
+detail4 <- detail4 %>%
+  mutate(patient_id = as.character(patient_id))
+
+#STEP 1: use full join to merge roster2 and detail 4, by patient id
+clean <- full_join(roster2, detail4, by= c("patient_id")) %>% 
+  mutate(
+    #STEP 2: create flags for data that is missing in roster and detail
+    roster=ifelse(is.na(roster), 0, 1),
+    ondetail=ifelse(is.na(ondetail), 0, 1),
+    
+    #STEP 3: create birth cohort based on year of birth
+    birth_cohort = year(dob),
+    
+    #STEP 4: clean gender variable
+    gender = case_when(
+      gender %in% c("Transgender", "Unknown", NA) ~ "Unknown/Missing",
+      TRUE ~ gender),  # Keep the original value for other cases
+    
+    #STEP 5: make county uppercase
+    county = toupper(county)
+  ) %>% #mutate close
+  
+  #STEP 6: subset to only include active patients 
+  subset(., clinic_status == "ACTIVE") 
+
+```
+
+```{r merge reminder3 and clean, include=FALSE}
+#STEP 1: use full join to merge clean and reminder4, by patient id
+clean2 <- full_join(
+  clean,
+  reminder4 %>% select(-age_months),
+  by = "patient_id"
+) %>%
+  mutate(
+    roster    = ifelse(is.na(roster), 0, 1),
+    onreminder = ifelse(is.na(onreminder), 0, 1)
+  ) %>%
+  filter(roster == 1)
+
+```
+
+QA merge
+
+```{r merge2 qa, include=FALSE}
+# --------------------------#
+#     QA CLEAN DATASET      #
+# --------------------------# -->
+
+#cross tab and counts of selected variables
+clean2 %>% 
+  count(roster, detail)
+
+clean2 %>% 
+  count(age_months)
+
+clean2 %>% 
+  count(age_years)
+
+clean2 %>% 
+  count(agegroup)
+
+clean %>% 
+  count(clinic_status)
+
+clean2 %>% 
+  count(gender)
+
+#variables names in alphabetical order
+sort(colnames(clean))
+
+# QA records with no BCG date
+na_bcg <- clean %>%
+  filter(is.na(bcg_date1))
+
+clean2 %>% 
+  count(county)
+n_distinct(clean2$county)
+sort(unique(clean2$county))
+
+na_bcg
+
+#ensure county values are all uppercase (important for cleaning counties in next step)
+clean2 %>% 
+  count(county)
+
+#---------------------------------------
+
+gender_data <- clean %>%
+  filter(gender == "Unknown/Missing")
+
+#--------------------------------------
+clean %>% 
+  count(roster, detail)
+
+roster_detail_data <- clean %>%
+  filter(roster == 1 & detail == 0)
+
+roster_detail_data
+
+```
+
+# HIB code
+
+Based on clinical guidance related to product types and catch-up
+guidance
+
+```{r hib, include=FALSE}
+
+# ---------------------------------------#
+# REMOVE NON-HIB PRODCUSTS FROM ANALYSIS #
+# ---------------------------------------#
+# ----------------------------------------------------------------------------------
+# STEP 1: Filter hib products using cvx codes
+# STEP 2: Extract patient id from patient name and reformat to match roster
+# STEP 3: Create flag for detail
+# ----------------------------------------------------------------------------------
+
+#STEP 1: remove all non-hib products from detail for this analysis
+hib <- detail2 %>%
+  filter(vaccination_code_id %in% c("17", "22", "46", "47", "48", "49", 
+                                      "50", "51", "102", "120", 
+                                      "132", "146", "148", 
+                                      "170", "198")) %>%
+  mutate(
+  # STEP 2: extract patient id from the parentheses in patient_name variable
+    patient_id = gsub(".*\\((\\d+)\\).*", "\\1", patient_name),
+    patient_id = gsub("[^0-9]", "", patient_id),
+    
+  #STEP 3 create a flag indicator to indicate the patient had at least 1 dose in webiz 
+    detail = 1
+    
+    )#mutate end
+
+# View the resulting data 
+head(hib)
+```
+
+QA HIB
+
+```{r hib qa, include=FALSE}
+
+head(hib)
+table(hib$vaccination_code_id)
+colnames(hib)
+  
+```
+
+# Merge clean data frame and Hib
+
+NOTE: This clean dataset needs to match main clean dataset that is
+created later in main code!
+
+STEP 1: Use full join to merge roster2 and hib, by patient id
+
+STEP 2: Complete flags for records missing in roster, detail
+
+STEP 3: Make county variable values upper case
+
+STEP 4: Create birth cohort year
+
+STEP 5: Clean gender
+
+STEP 6: Make county uppercase
+
+STEP 7: Subset to only include active patients
+
+STEP 8: Remove unwanted variables
+
+```{r merge hib and roster2, include=FALSE}
+
+#STEP 1: use full join to merge roster2 and hib, by patient id
+clean_hib <- full_join(roster2, hib, by= c("patient_id")) %>% 
+  mutate(
+    #STEP 2: create flags for data that is missing in roster and detail
+    roster=ifelse(is.na(roster), 0, 1),
+    detail=ifelse(is.na(detail), 0, 1),
+    #STEP 3: clean variable names that have been duplicated
+    dob = coalesce(dob.x, dob.y),
+    agegroup = coalesce(agegroup.x, agegroup.y),
+    #hospital_id = coalesce(hospital_id.x, hospital_id.y),
+    #STEP 4: create birth cohort year
+    birth_cohort = year(dob),
+    #STEP 5: clean gender
+    gender = case_when(
+      gender %in% c("Transgender", "Unknown", NA) ~ "Unknown/Missing",
+      TRUE ~ gender),  # Keep the original value for other cases
+    #STEP 6: make county uppercase
+    county = toupper(county)
+  ) %>% #mutate close
+  #STEP 7: subset to only include active patients 
+  subset(., clinic_status == "ACTIVE") %>% 
+  #STEP 8: remove unwanted variables
+  select(-dob.x, -dob.y, -agegroup.x, -agegroup.y, -hospital_id.x, -hospital_id.y)
+
+```
+
+QA clean hib
+
+```{r clean_hib qa, include=FALSE}
+
+head(clean_hib)
+colnames(clean_hib)
+table(clean_hib$birth_cohort)
+table(clean_hib$clinic_status)
+table(clean_hib$age_months)
+table(clean_hib$age_years)
+  
+```
+
+# ADD dose number column
+
+STEP 1: Sort by patient_id and vaccination_date
+
+STEP 2: Group by patient_id
+
+STEP 3: Increment dose number unless vaccination date is na
+
+STEP 4: Calculate age at dose in days
+
+STEP 5: Convert days to months
+
+STEP 6: Drop unnecessary variables
+
+NOTE: The use of ungroup() is a good practice in data manipulation
+workflows when working with grouped data frames in R's tidyverse. It
+ensures that subsequent operations are performed on the entire dataset
+rather than within groups unless explicitly intended.
+
+```{r hib dose number, include=FALSE}
+clean_hib2 <- clean_hib %>%
+  mutate(
+  ) %>%
+  #STEP 1: sort by patient_id and vaccination_date
+  arrange(patient_id, vaccination_date) %>%  
+  #STEP 2: group by patient_id
+  group_by(patient_id) %>%                   
+  mutate(
+    dose_number = ifelse(is.na(vaccination_date), NA, 
+                         #STEP 3: increment dose number unless vaccination date is na
+                         cumsum(!is.na(vaccination_date))), 
+     #STEP 4: calculate age at dose in days
+    age_dose_days = as.numeric(vaccination_date - dob),  
+    #STEP 5: convert days to months
+    age_dose_mos = floor(age_dose_days / 30.41667) 
+  ) %>%
+  # see note
+  ungroup() %>%
+  #STEP 6: drop unnecessary variables
+  select(-created_by,
+         -hl7_facility_code,
+         -last_updated_date_time,
+         -patient_default_clinic_v_trck_s_pin,
+         -lot_num, -expiration_date, -funding_source,
+         -age, -inactive_reason, -patient_name,
+         -history_only, -invalid_only,
+         -vaccine_manufacturer, -vaccine_clinic_v_trck_s_pin) 
+
+
+```
+
+QA clean hib2
+
+```{r clean_hib2 qa, include=FALSE}
+
+head(clean_hib2)
+sort(colnames(clean_hib2))
+#as.data.frame() allows you to see values clearer and more organized than table() alone
+as.data.frame(table(clean_hib2$age_dose_days))
+as.data.frame(table(clean_hib2$age_dose_mos))
+as.data.frame(table(clean_hib2$vaccination_date))
+as.data.frame(table(clean_hib2$dose_number))
+  
+```
+
+# RE-ORDER COLUMNS
+
+List columns in desired order to reorder them
+
+```{r hib ordering columns, include=FALSE}
+#STEP 1: list columns in desired order using select statement
+clean_hib3 <- clean_hib2 %>%
+   
+  select(patient_id, last_name, first_name, dob,
+         vaccination_code_id, vaccination_code, vaccination_date,
+         dose_number, age_dose_mos, provider, clinic,
+         last_vaccination_date, clinic_status, county,
+         status_eff_date, birth_cohort,
+         gender, vaccine_clinic,
+         patient_default_clinic, detail, roster) # reorder columns
+
+```
+
+QA clean Hib3
+
+```{r clean_hib3 qa, include=FALSE}
+#qa column names are in desired order, and view data
+colnames(clean_hib3)
+head(clean_hib3)
+  
+```
+
+# Create product flags
+
+STEP 1: Set dose_number and vaccination_code_id for kids on roster with
+no dose
+
+STEP 2: Create product variable based on conditions
+
+```{r hib flag product names and no hib doses, include=FALSE}
+clean_hib4 <- clean_hib3 %>%
+  mutate(
+    #STEP 1: set dose_number and vaccination_code_id for kids on roster with no dose
+    dose_number = ifelse(is.na(vaccination_date), 99, dose_number),
+    vaccination_code_id = ifelse(is.na(vaccination_date), "99", vaccination_code_id),
+    vaccination_code = ifelse(is.na(vaccination_date), "no dose", vaccination_code),
+    
+    #STEP 2: create product variable based on conditions
+    product = case_when(
+      vaccination_code_id == "99" ~ "none",
+      vaccination_code_id == "49" ~ "pedvaxhib",
+      TRUE ~ "ahpvuo" #ahpvuo=ActHIB, Hiberix,Pentacel, Vaxelis, Unknown, Other 
+    ) #case close
+  ) #mutate close
+
+```
+
+QA clean Hib4
+
+```{r clean_hib4 qa, include=FALSE}
+#qa column names are in desired order, and view data
+head(clean_hib4)
+table(clean_hib4$vaccination_code_id, clean_hib4$product)
+as.data.frame(table(clean_hib4$product))
+as.data.frame(table(clean_hib4$dose_number))
+ 
+```
+
+# Create product dose number
+
+STEP 1: Filter rows to keep only those with doses
+
+STEP 2: Transpose data creating product dose number
+
+```{r hib create product dose number, include=FALSE}
+# STEP 1: filter rows to keep only those with doses
+clean_hib4_filtered <- clean_hib4 %>%
+  filter(product != "none")
+
+# STEP 2: transpose data creating product dose number
+product_dosenum <- clean_hib4_filtered %>%
+  select(patient_id, dose_number, product) %>% # select relevant columns
+  pivot_wider(names_from = dose_number, values_from = product,
+              names_prefix = "product_") # create wide format with prefix
+
+```
+
+
+QA clean product dose number and county data
+
+```{r product dose number qa, include=FALSE}
+#qa column names are in desired order, and view data
+head(product_dosenum)
+colnames(product_dosenum)
+as.data.frame(table(product_dosenum$product_3))
+table(product_dosenum$product_1, product_dosenum$product_2)
+table(product_dosenum$product_2, product_dosenum$product_3)
+table(product_dosenum$product_3, product_dosenum$product_4)
+
+# Review county data for cleaning
+clean2 %>% 
+  count(county)
+
+clean2 %>% 
+  count(state)
+
+n_distinct(clean2$county)
+sort(unique(clean2$county))
+
+# Export clinic and county values for QA
+
+export_county <- clean2 %>%
+  select(provider, clinic, state, county, rr_county)
+
+today <- format(Sys.Date(), "%m%d%y")
+
+county_file <- file.path(
+  output_dir,
+  paste0(
+    "Raw_Provider_Clinic_Locations_",
+    today,
+    ".xlsx"
+  )
+)
+
+writexl::write_xlsx(
+  export_county,
+  path = county_file
+)
+```
+
+# HIB code end - back to regular code
+
+# Palau County Cleaning
+
+Palau does not have usable sub-county data in this workflow. The geographic
+hierarchy used here is:
+
+1. Keep a valid patient county when present.
+2. If county is missing or does not match the county workbook, search the clinic
+   name for a known Palau county.
+3. If no known county appears in the clinic name, assign the patient to Koror.
+4. Set `state = "PALAU"` and retain `region = "PALAU"` only as a compatibility
+   field. The dashboard does not expose a region selector.
+
+```{r updated cleaning counties, include=FALSE}
+# =============================================================================
+# Palau GEOGRAPHY CLEANING
+# =============================================================================
+
+normalize_palau_text <- function(x) {
+  x %>%
+    as.character() %>%
+    str_replace_all("\\u00A0", " ") %>%
+    str_squish() %>%
+    str_to_upper()
+}
+
+standardize_palau_county <- function(x) {
+  value <- normalize_palau_text(x)
+  value[value %in% c("", "NA", "N/A", "UNKNOWN", "UNK", "ZZ-UNKNOWN-PALAU")] <- NA_character_
+  recode(
+    value,
+    "NGERCHELONG" = "NGARCHELONG",
+    "NGARACHELONG" = "NGARCHELONG",
+    "NGEREMLENGUI" = "NGAREMLENGUI"
+  )
+}
+
+palau_county_lookup <- palau_county_raw %>%
+  transmute(
+    county = standardize_palau_county(county),
+    latitude_county = readr::parse_number(
+      str_replace_all(as.character(latitude), "\\u00A0", "")
+    ),
+    longitude_county = readr::parse_number(
+      str_replace_all(as.character(longitude), "\\u00A0", "")
+    ),
+    census_total = readr::parse_number(as.character(x2020_population)),
+    area_km2 = readr::parse_number(as.character(land_area_km2))
+  ) %>%
+  filter(!is.na(county)) %>%
+  mutate(
+    area_m2 = area_km2 * 1e6,
+    population_density_km2 = if_else(
+      !is.na(census_total) & !is.na(area_km2) & area_km2 > 0,
+      census_total / area_km2,
+      NA_real_
+    )
+  ) %>%
+  distinct(county, .keep_all = TRUE)
+
+valid_palau_counties <- palau_county_lookup$county
+clinic_match_order <- valid_palau_counties[
+  order(nchar(valid_palau_counties), decreasing = TRUE)
+]
+
+if (!"KOROR" %in% valid_palau_counties) {
+  stop("The Palau county workbook must contain KOROR for the default assignment rule.")
+}
+
+infer_palau_county_from_clinic <- function(clinic) {
+  clinic_key <- normalize_palau_text(clinic) %>%
+    str_replace_all("\\bNGERCHELONG\\b|\\bNGARACHELONG\\b", "NGARCHELONG") %>%
+    str_replace_all("\\bNGEREMLENGUI\\b", "NGAREMLENGUI")
+
+  vapply(
+    clinic_key,
+    function(value) {
+      if (is.na(value) || value == "") return(NA_character_)
+      matches <- clinic_match_order[
+        str_detect(value, fixed(clinic_match_order))
+      ]
+      if (length(matches) == 0) return(NA_character_)
+      matches[[1]]
+    },
+    character(1)
+  )
+}
+
+clean3 <- clean2 %>%
+  mutate(
+    county_roster = standardize_palau_county(county),
+    clinic_inferred_county = infer_palau_county_from_clinic(clinic),
+    county = case_when(
+      county_roster %in% valid_palau_counties ~ county_roster,
+      clinic_inferred_county %in% valid_palau_counties ~ clinic_inferred_county,
+      TRUE ~ "KOROR"
+    ),
+    geography_assignment_source = case_when(
+      county_roster %in% valid_palau_counties ~ "Valid county field",
+      clinic_inferred_county %in% valid_palau_counties ~ "County name found in clinic",
+      TRUE ~ "Koror default"
+    ),
+    city = NA_character_,
+    state = "PALAU",
+    region = "PALAU"
+  ) %>%
+  filter(!is.na(patient_id)) %>%
+  select(
+    -county_roster,
+    -clinic_inferred_county
+  )
+```
+
+QA county data
+
+```{r qa of county, include=FALSE}
+palau_geography_assignments <- clean3 %>%
+  count(geography_assignment_source, county, clinic, sort = TRUE)
+
+palau_geography_qa_file <- file.path(
+  output_dir,
+  "QA_Palau_Geography_Assignments.xlsx"
+)
+
+writexl::write_xlsx(
+  palau_geography_assignments,
+  path = palau_geography_qa_file
+)
+```
+
+# Merge HIB PRODUCT_DOSENUM & create vacine indicators
+
+```{r vaccine indicators part 1, include=FALSE}
+#this is creating the indicators, and making them numeric so they can later be counted
+#this step must be done in a separate code chunk from counting doses and creating UTD variables. 
+
+clean4 <- clean3 %>% 
+
+#merge data frames by patient_id
+left_join(product_dosenum, by = "patient_id") %>%  
+  mutate(
+    
+#check after join to make sure no additional patients are added to the dataframe
+    
+    ################## BCG ##################
+    
+    bcg1 = as.numeric(ifelse(!is.na(bcg_date1), 1, 0)),
+    
+    ################## DTAP ##################
+    
+    dtap1 = as.numeric(ifelse(!is.na(dtap_date1), 1, 0)),
+    dtap2 = as.numeric(ifelse(!is.na(dtap_date2), 1, 0)),
+    dtap3 = as.numeric(ifelse(!is.na(dtap_date3), 1, 0)),
+    dtap4 = as.numeric(ifelse(!is.na(dtap_date4), 1, 0)),
+    dtap5 = as.numeric(ifelse(!is.na(dtap_date5), 1, 0)),
+
+    ################## IPV ##################
+    
+    ipv1 = as.numeric(ifelse(!is.na(ipv_date1), 1, 0)),
+    ipv2 = as.numeric(ifelse(!is.na(ipv_date2), 1, 0)),
+    ipv3 = as.numeric(ifelse(!is.na(ipv_date3), 1, 0)),
+    ipv4 = as.numeric(ifelse(!is.na(ipv_date4), 1, 0)),
+
+    ################## MMR ##################
+    
+    mmr1 = as.numeric(ifelse(!is.na(mmr_date1), 1, 0)),
+    mmr2 = as.numeric(ifelse(!is.na(mmr_date2), 1, 0)),
+    
+    ################## HEPB ##################
+    
+    hepb1 = as.numeric(ifelse(!is.na(hepb_date1), 1, 0)),
+    hepb2 = as.numeric(ifelse(!is.na(hepb_date2), 1, 0)),
+    hepb3 = as.numeric(ifelse(!is.na(hepb_date3), 1, 0)),
+    
+    ################## PCV ##################
+    
+    pcv1 = as.numeric(ifelse(!is.na(pcv_date1), 1, 0)),
+    pcv2 = as.numeric(ifelse(!is.na(pcv_date2), 1, 0)),
+    pcv3 = as.numeric(ifelse(!is.na(pcv_date3), 1, 0)),
+    pcv4 = as.numeric(ifelse(!is.na(pcv_date4), 1, 0)),
+    
+    ################## HIB ##################
+    
+    hib1 = as.numeric(ifelse(!is.na(hib_date1), 1, 0)),
+    hib2 = as.numeric(ifelse(!is.na(hib_date2), 1, 0)),
+    hib3 = as.numeric(ifelse(!is.na(hib_date3), 1, 0)),
+    hib4 = as.numeric(ifelse(!is.na(hib_date4), 1, 0)),
+    
+    ################## ROTA ##################
+    
+    rota1 = as.numeric(ifelse(!is.na(rota_date1), 1, 0)),
+    rota2 = as.numeric(ifelse(!is.na(rota_date2), 1, 0)),
+    rota3 = as.numeric(ifelse(!is.na(rota_date3), 1, 0)),
+
+  ) #mutate close
+
+```
+
+QA clean3
+
+```{r qa clean 3, include=FALSE}
+print(clean3)
+
+```
+
+# Count doses
+
+```{r counting and creating doses, include=FALSE}
+#counting doses and creating UTD variables 
+
+clean5 <- clean4 %>% 
+  mutate(
+    
+    ################## BCG BIRTHDOSE ##################
+    #Counts a birth dose as given withing 3 days of birth
+    
+    bcg1days = as.numeric(difftime(bcg_date1, dob, unit = "days")),
+    bcgbirthdose = ifelse(is.na(bcg_date1), 0, ifelse(bcg1days <=3, 1, 0)),
+    
+    ################## HEPB BIRTHDOSE ##################
+    
+    hepb1days = as.numeric(difftime(hepb_date1, dob, unit = "days")),
+    hepbbirthdose = ifelse(is.na(hepb_date1), 0, ifelse(hepb1days <=3, 1, 0)),
+    
+    ################## DTAP ##################
+    
+    dtapcount = rowSums(select(., c(dtap1, dtap2, dtap3, dtap4, dtap5))),
+    dtap1utd =ifelse(dtapcount >= 1, 1, 0),
+    dtap2utd =ifelse(dtapcount >= 2, 1, 0),
+    dtap3utd =ifelse(dtapcount >= 3, 1, 0),
+    dtap4utd =ifelse(dtapcount >= 4, 1, 0),
+    dtap5utd =ifelse(dtapcount >= 5, 1, 0),
+    
+    # -----------------------------
+    # dtap 5/4 indicator
+    # -----------------------------
+
+    # age at dtap4
+    dtap4days  = as.numeric(dtap_date4 - dob),
+    dtap4years = floor(dtap4days / 365),
+
+    dtap4yo = if_else(dtap4years >= 4, 1, 0),
+
+    dtap54utd = if_else(
+      dtap5utd == 1 | dtap4yo == 1,
+      1, 0
+    ),
+    
+  dtap_utd = case_when(
+  age_months < 2 ~ NA_real_,
+  age_months >= 2 & age_months <= 3 & dtap1utd == 1 ~ 1,
+  age_months >= 4 & age_months <= 5 & dtap2utd == 1 ~ 1,
+  age_months >= 6 & age_months <= 11 & dtap3utd == 1 ~ 1,
+  age_months >= 12 & age_months <= 47 & dtap4utd == 1 ~ 1,
+  age_months >= 48 & age_months <= 83 & dtap54utd == 1 ~ 1,
+  age_months >= 2 & age_months <= 83 ~ 0,
+  TRUE ~ NA_real_
+  ),
+    
+    ################## IPV ##################
+    
+    ipvcount = rowSums(select(., c(ipv1, ipv2, ipv3, ipv4))),
+    ipv1utd =ifelse(ipvcount >= 1, 1, 0),
+    ipv2utd =ifelse(ipvcount >= 2, 1, 0),
+    ipv3utd =ifelse(ipvcount >= 3, 1, 0),
+    ipv4utd =ifelse(ipvcount >= 4, 1, 0),
+    
+      # -----------------------------
+    # polio 4/3 indicator
+    # -----------------------------
+
+    # age at ipv3
+    ipv3days  = as.numeric(ipv_date3 - dob),
+    ipv3years = floor(ipv3days / 365),
+
+    ipv4yo = if_else(ipv3years >= 4, 1, 0),
+
+    ipv43utd = if_else(
+      ipv4utd == 1 | ipv4yo == 1,
+      1, 0 ),
+    
+  ipv_utd = case_when(
+  age_months < 2 ~ NA_real_,
+  age_months >= 2 & age_months <= 3 & ipv1utd == 1 ~ 1,
+  age_months >= 4 & age_months <= 5 & ipv2utd == 1 ~ 1,
+  age_months >= 6 & age_months <= 47 & ipv3utd == 1 ~ 1,
+  age_months >= 48 & age_months <= 83 & ipv43utd == 1 ~ 1,
+  age_months >= 2 & age_months <= 83 ~ 0,
+  TRUE ~ NA_real_
+  ),
+    ################## MMR ##################
+    
+    mmrcount = rowSums(select(., c(mmr1, mmr2))),
+    mmr1utd =ifelse(mmrcount >= 1, 1, 0),
+    mmr2utd =ifelse(mmrcount >= 2, 1, 0),
+    
+   mmr_utd = case_when(
+  age_months < 12 ~ NA_real_,
+  age_months >= 12 & age_months <= 47 & mmr1utd == 1 ~ 1,
+  age_months >= 48 & age_months <= 83 & mmr2utd == 1 ~ 1,
+  age_months >= 12 & age_months <= 83 ~ 0,
+  TRUE ~ NA_real_
+  ),
+    ################## HEPB ##################
+    
+    hepbcount = rowSums(select(., c(hepb1, hepb2, hepb3))),
+    hepb1utd =ifelse(hepbcount >= 1, 1, 0),
+    hepb2utd =ifelse(hepbcount >= 2, 1, 0),
+    hepb3utd =ifelse(hepbcount >= 3, 1, 0),
+    
+  hepb_utd = case_when(
+  age_months >= 0 & age_months <= 3 & hepb1utd == 1 ~ 1,
+  age_months >= 4 & age_months <= 4 & hepb2utd == 1 ~ 1,
+  age_months >= 6 & age_months <= 83 & hepb3utd == 1 ~ 1,
+  age_months >= 2 & age_months <= 83 ~ 0,
+  TRUE ~ NA_real_
+  ),
+  
+    ################## PCV ##################
+    
+    pcvcount = rowSums(select(., c(pcv1, pcv2, pcv3, pcv4))),
+    pcv1utd =ifelse(pcvcount >= 1, 1, 0),
+    pcv2utd =ifelse(pcvcount >= 2, 1, 0),
+    pcv3utd =ifelse(pcvcount >= 3, 1, 0),
+    pcv4utd =ifelse(pcvcount >= 4, 1, 0),
+    
+    ################## ROTA ##################
+    
+    rotacount = rowSums(select(., c(rota1, rota2, rota3))),
+    rota1utd =ifelse(rotacount >= 1, 1, 0),
+    rota2utd =ifelse(rotacount >= 2, 1, 0),
+    rota3utd =ifelse(rotacount >= 3, 1, 0),
+    
+    ################## HIB ##################
+    
+    hibcount = rowSums(select(., c(hib1, hib2, hib3, hib4))),
+    hib1utd =ifelse(hibcount >= 1, 1, 0),
+    hib2utd =ifelse(hibcount >= 2, 1, 0),
+    hib3utd =ifelse(hibcount >= 3, 1, 0),
+    hib4utd =ifelse(hibcount >= 4, 1, 0),
+    
+#--------------------------------------------------------------------------
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+         ################## HIB UTD ##################
+
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#--------------------------------------------------------------------------
+    
+#If patient received ahpvuo primary series or mix of first two doses, need 4 doses: 2, 4, 6, and 15-18 months
+
+#if the second or third dose is after 12 months, don't need the 4th dose
+
+#if patient received pedvaxhib primary series, need 3 doses: 2, 4, and 12-15 months
+
+####################### product_dosenum is needed here (merged in earlier code)  #######################
+
+#if mix of products:
+#if first two doses are pedvaxhib, only need 3rd dose at 12 – 15 months
+#if first two are a 3-dose primary series product or one pedvaxhib + 1 other, then need 3rd dose at 6 months and 4th dose at 12 – 15 months;
+
+  
+    any_ahpvuo = ifelse(product_1 == "ahpvuo" | 
+                        product_2 == "ahpvuo" | 
+                        product_3 == "ahpvuo" | 
+                        product_4 == "ahpvuo", 1, 0),
+    
+    any_pedvaxhib = ifelse(product_1 == "pedvaxhib" | 
+                           product_2 == "pedvaxhib" | 
+                           product_3 == "pedvaxhib" | 
+                           product_4 == "pedvaxhib", 1, 0),
+    
+    primary_ahpvuo = ifelse(product_1 == "ahpvuo" & 
+                             product_2 == "ahpvuo", 1, 0),
+    
+    primary_pedvaxhib = ifelse(product_1 == "pedvaxhib" & 
+                                product_2 == "pedvaxhib", 1, 0),
+    
+    primary_mix = ifelse((product_1 == "ahpvuo" & product_2 == "pedvaxhib") | 
+                         (product_1 == "pedvaxhib" & product_2 == "ahpvuo"), 1, 0),
+    
+#calculate age at each dose
+    #age in days
+    hib1days = as.numeric(difftime(hib_date1, dob, unit = "days")),
+    hib2days = as.numeric(difftime(hib_date2, dob, unit = "days")),
+    hib3days = as.numeric(difftime(hib_date3, dob, unit = "days")),
+    hib4days = as.numeric(difftime(hib_date4, dob, unit = "days")),
+    #age in months
+    hib1mos = floor(hib1days / 30.41667),
+    hib2mos = floor(hib2days / 30.41667),
+    hib3mos = floor(hib3days / 30.41667),
+    hib4mos = floor(hib4days / 30.41667),
+    #interval between doses
+    hibint12 = as.numeric(interval(hib_date1, hib_date2) / dweeks(1)),
+    hibint23 = as.numeric(interval(hib_date2, hib_date3) / dweeks(1)),
+    hibint34 = as.numeric(interval(hib_date3, hib_date4) / dweeks(1)),
+    hibint24 = as.numeric(interval(hib_date2, hib_date4) / dweeks(1)),
+    
+#create hibutd
+hib_utd = case_when(
+
+  # ------------------------------------------------------------
+  # Ages 2–3 months: UTD with at least 1 valid Hib dose
+  # ------------------------------------------------------------
+  age_months >= 2 & age_months <= 3 &
+    hib1utd == 1 ~ 1,
+
+  # ------------------------------------------------------------
+  # Ages 4–5 months: UTD with at least 2 valid Hib doses
+  # ------------------------------------------------------------
+  age_months >= 4 & age_months <= 5 &
+    hib2utd == 1 ~ 1,
+
+  # ------------------------------------------------------------
+  # Ages 6–11 months
+  # AHPVUO or mixed primary series: 3 valid doses
+  # ------------------------------------------------------------
+  age_months >= 6 & age_months <= 11 &
+    (primary_ahpvuo == 1 | primary_mix == 1) &
+    hib3utd == 1 ~ 1,
+
+  # PedvaxHIB primary series: 2 valid doses
+  age_months >= 6 & age_months <= 11 &
+    primary_pedvaxhib == 1 &
+    hib2utd == 1 ~ 1,
+
+  # ------------------------------------------------------------
+  # Ages 12–18 months
+  # AHPVUO or mixed primary series: 4 valid doses
+  # ------------------------------------------------------------
+  age_months >= 12 & age_months <= 18 &
+    (primary_ahpvuo == 1 | primary_mix == 1) &
+    hib4utd == 1 ~ 1,
+
+  # PedvaxHIB primary series:
+  # 3 valid doses, with dose 3 given at age 12 months or older
+  age_months >= 12 & age_months <= 18 &
+    primary_pedvaxhib == 1 &
+    hib3utd == 1 &
+    hib3mos >= 12 ~ 1,
+
+  # PedvaxHIB primary series:
+  # alternatively, UTD if a fourth valid dose was received
+  age_months >= 12 & age_months <= 18 &
+    primary_pedvaxhib == 1 &
+    hib4utd == 1 ~ 1,
+
+  # ------------------------------------------------------------
+  # Ages 19–83 months: three-dose product primary series
+  # ------------------------------------------------------------
+  age_months >= 19 & age_months <= 83 &
+    primary_ahpvuo == 1 &
+    hib1utd == 1 & hib1mos < 12 &
+    hib2utd == 1 & hib2mos < 12 &
+    hib3utd == 1 & hib3mos < 12 &
+    hib4utd == 1 & hib4mos >= 12 ~ 1,
+
+  # Two-dose PedvaxHIB primary series
+  age_months >= 19 & age_months <= 83 &
+    primary_pedvaxhib == 1 &
+    hib1utd == 1 & hib1mos < 12 &
+    hib2utd == 1 & hib2mos < 12 &
+    hib3utd == 1 & hib3mos >= 12 ~ 1,
+
+  # Mixed primary series
+  age_months >= 19 & age_months <= 83 &
+    primary_mix == 1 &
+    hib1utd == 1 & hib1mos < 12 &
+    hib2utd == 1 & hib2mos < 12 &
+    hib3utd == 1 & hib3mos < 12 &
+    hib4utd == 1 & hib4mos >= 12 ~ 1,
+
+  # ------------------------------------------------------------
+  # Catch-up rules for ages 12–83 months
+  # ------------------------------------------------------------
+
+  # Dose 1 at 7–11 months, dose 2 at least 4 weeks later,
+  # and dose 3 at age 12 months or older and at least
+  # 8 weeks after dose 2
+  age_months >= 12 & age_months <= 59 &
+    hib1utd == 1 &
+    hib1mos >= 7 & hib1mos < 12 &
+    hib2utd == 1 &
+    hibint12 >= 4 &
+    hib3utd == 1 &
+    hib3mos >= 12 &
+    hibint23 >= 8 ~ 1,
+
+  # Dose 1 at 12–14 months and dose 2 at least 8 weeks later
+  age_months >= 12 & age_months <= 59 &
+    hib1utd == 1 &
+    hib1mos >= 12 & hib1mos < 15 &
+    hib2utd == 1 &
+    hibint12 >= 8 ~ 1,
+
+  # Dose 1 before 12 months, dose 2 before 15 months,
+  # and dose 3 at least 8 weeks after dose 2
+  age_months >= 12 & age_months <= 83 &
+    hib1utd == 1 &
+    hib1mos < 12 &
+    hib2utd == 1 &
+    hib2mos < 15 &
+    hib3utd == 1 &
+    hibint23 >= 8 ~ 1,
+
+  # One valid dose at age 15 months or older
+  age_months >= 15 & age_months <= 83 &
+    hib1utd == 1 &
+    hib1mos >= 15 ~ 1,
+
+  # Allow UTD with 3 valid doses of any product when
+  # dose 3 was administered at age 12 months or older
+  age_months >= 12 & age_months <= 83 &
+    hib3utd == 1 &
+    hib3mos >= 12 ~ 1,
+
+  # Children aged 2–83 months who do not meet an applicable rule
+  age_months >= 2 & age_months <= 83 ~ 0,
+
+  # Outside the assessed age range
+  TRUE ~ NA_real_
+),
+    
+
+#--------------------------------------------------------------------------
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+         ################## PCV UTD ##################
+
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#--------------------------------------------------------------------------
+    
+    #age at each dose
+    #days
+    pcv1days = as.numeric(difftime(pcv_date1, dob, unit = "days")),
+    pcv2days = as.numeric(difftime(pcv_date2, dob, unit = "days")),
+    pcv3days = as.numeric(difftime(pcv_date3, dob, unit = "days")),
+    pcv4days = as.numeric(difftime(pcv_date4, dob, unit = "days")),
+    #months
+    pcv1mos = floor(pcv1days / 30.41667),
+    pcv2mos = floor(pcv2days / 30.41667),
+    pcv3mos = floor(pcv3days / 30.41667),
+    pcv4mos = floor(pcv4days / 30.41667),
+    
+#create pcvutd
+    pcv_utd = case_when(
+
+  # Routine age-specific schedule
+  age_months < 2 ~ NA_real_,
+
+  age_months >= 2 & age_months <= 3 &
+    pcv1utd == 1 ~ 1,
+
+  age_months >= 4 & age_months <= 5 &
+    pcv2utd == 1 ~ 1,
+
+  age_months >= 6 & age_months <= 11 &
+    pcv3utd == 1 ~ 1,
+
+  age_months >= 12 & age_months <= 83 &
+    pcv4utd == 1 ~ 1,
+
+  # Catch-up: 3 doses before 12 months and dose 4 after 12 months
+  age_months >= 12 & age_months <= 83 &
+    pcv1utd == 1 & pcv1mos < 12 &
+    pcv2utd == 1 & pcv2mos < 12 &
+    pcv3utd == 1 & pcv3mos < 12 &
+    pcv4utd == 1 & pcv4mos >= 12 ~ 1,
+
+  # Doses 1 and 2 before 12 months and dose 3 after 12 months
+  age_months >= 12 & age_months <= 83 &
+    pcv1utd == 1 & pcv1mos < 12 &
+    pcv2utd == 1 & pcv2mos < 12 &
+    pcv3utd == 1 & pcv3mos >= 12 ~ 1,
+
+  # Dose 1 before 12 months, dose 2 at 12–23 months,
+  # and dose 3 received
+  age_months >= 12 & age_months <= 83 &
+    pcv1utd == 1 & pcv1mos < 12 &
+    pcv2utd == 1 & pcv2mos >= 12 & pcv2mos < 24 &
+    pcv3utd == 1 ~ 1,
+
+  # Dose 1 before 12 months and dose 2 at 24 months or older
+  age_months >= 12 & age_months <= 83 &
+    pcv1utd == 1 & pcv1mos < 12 &
+    pcv2utd == 1 & pcv2mos >= 24 ~ 1,
+
+  # Dose 1 at 12–23 months and dose 2 received
+  age_months >= 12 & age_months <= 83 &
+    pcv1utd == 1 &
+    pcv1mos >= 12 & pcv1mos < 24 &
+    pcv2utd == 1 ~ 1,
+
+  # First dose at 24 months or older
+  age_months >= 24 & age_months <= 83 &
+    pcv1utd == 1 &
+    pcv1mos >= 24 ~ 1,
+
+  # Any child with four valid doses
+  age_months >= 2 & age_months <= 83 &
+    pcv4utd == 1 ~ 1,
+
+  # Not UTD within assessed age range
+  age_months >= 2 & age_months <= 83 ~ 0,
+
+  TRUE ~ NA_real_
+),
+
+#----------------------------------------------------------------------------
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  # ROTA UTD: Palau exclusively uses 3 dose product - check annually for update
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#----------------------------------------------------------------------------
+ 
+  #CREATE Palau-SPECIFIC MMR RECOMMENDATION - this is for field master list only, not for risk score
+
+  mmr_date1 = as.Date(mmr_date1),
+  days_since_mmr1 = as.numeric(Sys.Date() - mmr_date1),
+
+  need_mmr = str_detect(
+    immunization_recommendations,
+    regex("MMR/MEASLES\\s*\\(", ignore_case = TRUE)
+  ) |
+    (
+      age_months >= 12 & age_months <= 47 &   # age 1-3 years
+      mmr1utd == 1 &                          # received dose 1
+      mmr2utd == 0 &                          # has not received dose 2
+      days_since_mmr1 > 30                    # more than 30 days since dose 1
+    ),
+
+  MMR_Single = if_else(need_mmr, 1, 0)
+)
+#mutate close
+
+
+```
+
+QA CLEAN5
+
+```{r qa clean5, include=FALSE}
+clean5 %>% 
+count(bcgbirthdose)
+clean5 %>% 
+count(hepbbirthdose)
+clean5 %>% 
+count(dtap4utd)
+clean5 %>% 
+count(dtap_utd)
+clean5 %>% 
+count(ipv3utd)
+clean5 %>% 
+count(ipv_utd)
+clean5 %>% 
+count(mmr2utd)
+clean5 %>% 
+count(mmr_utd)
+clean5 %>% 
+count(hib3utd)
+clean5 %>% 
+count(hib_utd)
+clean5 %>% 
+count(hepb3utd)
+clean5 %>% 
+count(pcv4utd)
+clean5 %>% 
+count(pcv_utd)
+clean5 %>% 
+count(rota3utd)
+
+clean5 %>% 
+  filter(age_months >= 12 & age_months <= 35)%>% 
+count(mmr1utd)
+
+clean5 %>% 
+  filter(age_months >= 36 & age_months <= 59)%>% 
+count(mmr2utd)
+
+clean5 %>% 
+  filter(age_months >= 12 & age_months <= 59)%>% 
+count(mmr_utd)
+
+clean5 %>% 
+  filter(age_months >= 12 & age_months <= 83)%>% 
+count(mmr_utd)
+
+clean5 %>% 
+count(mmr_utd)
+
+clean5 %>% 
+count(county)
+
+```
+
+# Create vaccine series indicators, UTD for age, time since last vax, age at last vax
+
+```{r series indicators, include=FALSE}
+#creating utd series variables 
+
+clean6 <- clean5 %>% 
+  mutate(
+
+#SERIES 4:3:2:3:3:4
+#≥4 DTaP, ≥3 IPV, ≥2 MMR, ≥3 Hib, ≥3 HepB, and ≥4 PCV.
+   series432334= ifelse(dtap4utd==1 & ipv3utd==1 & mmr2utd==1 & hib3utd==1 & hepb3utd==1 & pcv4utd==1, 1, 0),
+   
+#SERIES 4:3:2:Hib UTD:3:PCV UTD 
+#≥4 DTaP, ≥3 IPV, ≥2 MMR, Hib UTD, ≥3 HepB, and PCV UTD. 
+  series432hibutd3pcvutd= ifelse(dtap4utd==1 & ipv3utd==1 & mmr2utd==1 & hib_utd==1 & hepb3utd==1 & pcv_utd==1, 1, 0),
+    
+#SERIES 4:3:1:3:3:4
+#≥4 DTaP, ≥3 IPV, ≥1 MMR, ≥3 Hib, ≥3 HepB, and ≥4 PCV.
+  series431334= ifelse(dtap4utd==1 & ipv3utd==1 & mmr1utd==1 & hib3utd==1 & hepb3utd==1  & pcv4utd==1, 1, 0), 
+
+#SERIES 4:3:1:Hib UTD:3:PCV UTD 
+#≥4 DTaP, ≥3 IPV, ≥1 MMR, Hib UTD, ≥3 HepB, and PCV UTD. 
+  series431hibutd3pcvutd= ifelse(dtap4utd==1 & ipv3utd==1 & mmr1utd==1 & hib_utd==1 & hepb3utd==1 & pcv_utd==1, 1, 0),
+    
+
+#UTD for age (includes MMR)
+utd = case_when(
+  # 2–3 months: 1 dtap, 1 ipv, 1 hib, 2 hepb, 1 pcv
+  agegroup == 1 &
+    dtap1utd == 1 & ipv1utd == 1 & hib1utd == 1 & hepb2utd == 1 & pcv1utd == 1 ~ 1,
+
+  # 4–5 months: 2 dtap, 2 ipv, 2 hib, 2 hepb, 2 pcv
+  agegroup == 2 &
+    dtap2utd == 1 & ipv2utd == 1 & hib2utd == 1 & hepb2utd == 1 & pcv2utd == 1 ~ 1,
+
+  # 6–11 months: 3 dtap, 3 ipv, 2 hib, 3 hepb, 3 pcv
+  agegroup == 3 &
+    dtap3utd == 1 & ipv3utd == 1 & hib2utd == 1 & hepb3utd == 1 & pcv3utd == 1 ~ 1,
+
+  # 12–18 months: 4 dtap, 3 ipv, 1 mmr, 3 hib, 3 hepb, 4 pcv
+  agegroup == 4 &
+    dtap4utd == 1 & ipv3utd == 1 & mmr1utd == 1 &
+    hib3utd == 1 & hepb3utd == 1 & pcv4utd == 1 ~ 1,
+
+  # 19–35 months - changed MMR to 1 for purpose of risk assessment
+  agegroup == 5 &
+    dtap4utd == 1 & ipv3utd == 1 & mmr1utd == 1 &
+    (hib3utd == 1 | hib_utd == 1) &
+    hepb3utd == 1 &
+    (pcv4utd == 1 | pcv_utd == 1) ~ 1,
+
+  # 36–47 months - changed MMR to 1 for purpose of risk assessment
+  agegroup == 6 &
+    dtap4utd == 1 & ipv3utd == 1 & mmr1utd == 1 &
+    (hib3utd == 1 | hib_utd == 1) &
+    hepb3utd == 1 &
+    (pcv4utd == 1 | pcv_utd == 1) ~ 1,
+
+  # 48–59 months
+  agegroup == 7 &
+    dtap54utd == 1 & ipv43utd == 1 & mmr2utd == 1 &
+    (hib3utd == 1 | hib_utd == 1) &
+    hepb3utd == 1 &
+    (pcv4utd == 1 | pcv_utd == 1) ~ 1,
+  
+    # 60–71 months
+  agegroup == 8 &
+    dtap54utd == 1 & ipv43utd == 1 & mmr2utd == 1 &
+    (hib3utd == 1 | hib_utd == 1) &
+    hepb3utd == 1 &
+    (pcv4utd == 1 | pcv_utd == 1) ~ 1,
+  
+    # 72–83 months
+  agegroup == 9 &
+    dtap54utd == 1 & ipv43utd == 1 & mmr2utd == 1 &
+    (hib3utd == 1 | hib_utd == 1) &
+    hepb3utd == 1 &
+    (pcv4utd == 1 | pcv_utd == 1) ~ 1,
+
+  TRUE ~ 0
+),
+
+
+#UTD for age - NO MMR included
+utd_no_mmr = case_when(
+  # 2–3 months: 1 dtap, 1 ipv, 1 hib, 2 hepb, 1 pcv
+  agegroup == 1 &
+    dtap1utd == 1 & ipv1utd == 1 & hib1utd == 1 & hepb2utd == 1 & pcv1utd == 1 ~ 1,
+
+  # 4–5 months: 2 dtap, 2 ipv, 2 hib, 2 hepb, 2 pcv
+  agegroup == 2 &
+    dtap2utd == 1 & ipv2utd == 1 & hib2utd == 1 & hepb2utd == 1 & pcv2utd == 1 ~ 1,
+
+  # 6–11 months: 3 dtap, 3 ipv, 2 hib, 3 hepb, 3 pcv
+  agegroup == 3 &
+    dtap3utd == 1 & ipv3utd == 1 & hib2utd == 1 & hepb3utd == 1 & pcv3utd == 1 ~ 1,
+
+  # 12–18 months: 4 dtap, 3 ipv, 3 hib, 3 hepb, 4 pcv --- NO MMR
+  agegroup == 4 &
+    dtap4utd == 1 & ipv3utd == 1 & hib3utd == 1 & hepb3utd == 1 & pcv4utd == 1 ~ 1,
+
+  # 19–35 months --- NO MMR
+  agegroup == 5 &
+    dtap4utd == 1 & ipv3utd == 1 & 
+    (hib3utd == 1 | hib_utd == 1) &
+    hepb3utd == 1 &
+    (pcv4utd == 1 | pcv_utd == 1) ~ 1,
+
+  # 36–47 months --- NO MMR
+  agegroup == 6 &
+    dtap4utd == 1 & ipv3utd == 1 & 
+    (hib3utd == 1 | hib_utd == 1) &
+    hepb3utd == 1 &
+    (pcv4utd == 1 | pcv_utd == 1) ~ 1,
+
+  # 48–59 months --- NO MMR
+  agegroup == 7 &
+    dtap54utd == 1 & ipv43utd == 1 & 
+    (hib3utd == 1 | hib_utd == 1) &
+    hepb3utd == 1 &
+    (pcv4utd == 1 | pcv_utd == 1) ~ 1,
+  
+   # 60-71 months --- NO MMR
+  agegroup == 8 &
+    dtap54utd == 1 & ipv43utd == 1 & 
+    (hib3utd == 1 | hib_utd == 1) &
+    hepb3utd == 1 &
+    (pcv4utd == 1 | pcv_utd == 1) ~ 1,
+  
+   # 72-83 months --- NO MMR
+  agegroup == 9 &
+    dtap54utd == 1 & ipv43utd == 1 & 
+    (hib3utd == 1 | hib_utd == 1) &
+    hepb3utd == 1 &
+    (pcv4utd == 1 | pcv_utd == 1) ~ 1,
+
+  TRUE ~ 0
+),
+
+
+  #time since last vax
+ years_since_last_vax = time_length(
+      interval(last_vaccination_date, Sys.Date()),
+      unit = "years"
+    ),
+
+ days_since_last_vax = time_length(
+      interval(last_vaccination_date, Sys.Date()),
+      unit = "days"
+    ),
+
+dob = as.Date(dob),
+last_vaccination_date = as.Date(last_vaccination_date),
+
+#age at last vax
+ age_last_vax = time_length(
+      interval(dob, last_vaccination_date),
+      unit = "months"
+    ),
+
+   last_vax_category = case_when(
+      years_since_last_vax < 1                       ~ "< 1 year",
+      years_since_last_vax >= 1 & years_since_last_vax < 2 ~ "1–2 years",
+      years_since_last_vax >= 2 & years_since_last_vax < 5 ~ "2–4 years",
+      years_since_last_vax >= 5                       ~ "≥ 5 years",
+      TRUE                                            ~ NA_character_
+    )
+  )
+
+   #mutate close
+```
+
+QA
+```{r}
+
+clean6 %>% 
+count(mmr_utd)
+
+clean6 %>% 
+count(utd)
+
+clean6 %>% 
+count(utd_no_mmr)
+
+
+```
+
+# Keep only age 2 - 83 months and select variables
+
+```{r clean7, include=FALSE}
+
+clean7 <- clean6 %>%
+  select(
+    provider,
+    clinic,
+    patient_id,
+    last_name,
+    first_name,
+    primary_contact_lastname_firstname,
+    gender,
+    dob,
+    age_months,
+    age_years,
+    agegroup,
+    address_line_1,
+    address_line_2,
+    city,
+    rr_county,
+    county,
+    state,
+    region,
+    zip,
+    last_vaccination_date,
+    years_since_last_vax,
+    days_since_last_vax,
+    age_last_vax,
+    last_vax_category,
+    
+    bcg_date1,
+    
+    dtap_date1, dtap_date2, dtap_date3, dtap_date4, dtap_date5, dtap_date6,
+  
+    ipv_date1, ipv_date2, ipv_date3, ipv_date4, ipv_date5, 
+    
+    mmr_date1, mmr_date2, mmr_date3, 
+    
+    hepb_date1, hepb_date2, hepb_date3, hepb_date4, hepb_date5,
+    
+    pcv_date1, pcv_date2, pcv_date3, pcv_date4, pcv_date5,
+    
+    hib_date1, hib_date2, hib_date3, hib_date4, 
+    
+    rota_date1, rota_date2, rota_date3, rota_date4,
+    
+    birth_cohort,
+    onreminder,
+    immunization_recommendations,
+    
+    RR_category,
+    rr_subcategory,
+    
+    need_dtap,
+    need_hepb,
+    need_ipv,
+    need_hib,
+    need_hib4,
+    need_hib123,
+    need_mmr,
+    need_pcv,
+    need_rota,
+    
+    PedVaxHib,
+    Vaxelis,
+    Pediarix,
+    DTaP_Single,
+    IPV_Single,
+    MMR_Single,
+    Prevnar,
+    RotaTeq,
+    
+    utd,
+    utd_no_mmr,
+   
+    
+    dtap1utd, dtap2utd, dtap3utd, dtap4utd, dtap5utd, dtap54utd, dtap_utd,
+    
+    ipv1utd, ipv2utd, ipv3utd, ipv4utd, ipv43utd, ipv_utd,
+    
+    mmr1utd, mmr2utd,  mmr_utd,
+    
+    hepb1utd, hepb2utd, hepb3utd, hepb_utd, 
+    
+    pcv1utd, pcv2utd, pcv3utd, pcv4utd, pcv_utd,
+    
+    rota1utd, rota2utd, rota3utd,
+    
+    hib1utd, hib2utd, hib3utd, hib4utd, hib_utd, primary_pedvaxhib,
+    
+    series432334,
+    series432hibutd3pcvutd,
+    series431334,
+    series431hibutd3pcvutd,)
+
+```
+
+QA CLEAN7
+
+```{r qa clean7, include=FALSE}
+
+print(clean7)
+
+
+clean7 %>%
+  count(agegroup)
+
+clean7 %>%
+  count(county)
+
+names(clean7)
+
+```
+
+# Assign Palau county coordinates and reminder/recall map coordinates
+
+All coverage, priority, reminder/recall, profile, and routing layers use the
+county coordinates in `Palau_State_Population_Area_Density_2020.xlsx`. Palau has
+no sub-county mapping in this workflow.
+
+```{r palau geography mapping, include=FALSE}
+# =============================================================================
+# PALAU COUNTY COORDINATES, POPULATION, AND AREA
+# =============================================================================
+
+palau_county_coords <- palau_county_lookup %>%
+  transmute(
+    county_join = county,
+    latitude = latitude_county,
+    longitude = longitude_county,
+    census_total,
+    area_m2,
+    area_km2,
+    population_density_km2
+  )
+
+clean11_merged <- clean7 %>%
+  mutate(
+    county_join = standardize_palau_county(county)
+  ) %>%
+  left_join(
+    palau_county_coords,
+    by = "county_join"
+  ) %>%
+  mutate(
+    state = "PALAU",
+    region = "PALAU",
+    reminder_location = str_to_title(str_to_lower(county_join)),
+    reminder_latitude = latitude,
+    reminder_longitude = longitude,
+    reminder_coordinate_source = if_else(
+      !is.na(latitude) & !is.na(longitude),
+      "Palau county coordinate workbook",
+      "Missing"
+    )
+  ) %>%
+  select(
+    -county_join
+  )
+```
+
+QA Palau mapping
+
+```{r qa palau mapping, include=FALSE}
+# County coordinates missing after the GIS join.
+missing_county_coordinates <- clean11_merged %>%
+  filter(is.na(latitude) | is.na(longitude)) %>%
+  count(county, clinic, sort = TRUE)
+
+missing_coordinates_file <- file.path(
+  output_dir,
+  "QA_Palau_Missing_County_Coordinates.xlsx"
+)
+
+writexl::write_xlsx(
+  missing_county_coordinates,
+  path = missing_coordinates_file
+)
+
+# Reminder-map coordinate sources.
+clean11_merged %>%
+  count(reminder_coordinate_source, reminder_location, sort = TRUE)
+```
+
+# Create individual risk score
+
+```{r risk score, include=FALSE}
+
+clean12_merged <- clean11_merged %>%
+  mutate(
+    months_since_last_vax = days_since_last_vax / 30.4375,
+    
+    t_i = pmin(months_since_last_vax, 36, na.rm = TRUE),
+
+    #scale from 1 to 0
+    t_i_tilde = t_i / 36,
+
+    individual_risk_score = 100 * (
+      0.20 * if_else(utd_no_mmr == 1, 1, 0, missing = 0) +
+      0.55 * if_else(mmr_utd == 0, 1, 0, missing = 0) +
+      0.25 * t_i_tilde
+    )
+  )
+```
+
+QA
+
+```{r}
+
+clean12_merged%>%
+  count(individual_risk_score)
+
+```
+
+# Dataset 1 - Export final full patient-level dataframe to Excel
+
+```{r export_excel, echo=FALSE}
+getwd()
+
+if (!requireNamespace("openxlsx", quietly = TRUE)) {
+  install.packages("openxlsx")
+}
+
+today <- format(Sys.Date(), "%m%d%y")
+
+dataset_file <- file.path(
+  output_dir,
+  paste0(
+    "Dataset 1_Palau_2-83 Mos_Full Dataset_",
+    today,
+    ".xlsx"
+  )
+)
+
+openxlsx::write.xlsx(
+  clean12_merged,
+  file = dataset_file,
+  overwrite = TRUE
+)
+
+#Export de-identified dataset
+
+deid_dataset <- clean12_merged %>%
+  select(
+    -last_name,
+    -first_name,
+    -primary_contact_lastname_firstname
+  )
+
+deid_dataset_file <- file.path(
+  output_dir,
+  paste0(
+    "Dataset 2_Palau_2-83 Mos_DeID_Full_Dataset_",
+    today,
+    ".xlsx"
+  )
+)
+
+openxlsx::write.xlsx(
+  deid_dataset,
+  file = deid_dataset_file,
+  overwrite = TRUE
+)
+
+```
+
+#Export patients needing vaccination list
+```{r}
+# ==============================================================================
+# Export patients needing vaccination
+# ==============================================================================
+
+today <- format(
+  Sys.Date(),
+  "%m%d%y"
+)
+
+patients_needing_vaccination <- clean12_merged %>%
+
+  # Include children on reminder/recall plus children identified as needing
+  # an additional MMR dose through the analysis-specific MMR logic.
+  filter(
+    onreminder == 1 |
+      need_mmr == 1
+  ) %>%
+
+  select(
+    patient_id,
+    last_name,
+    first_name,
+    primary_contact_lastname_firstname,
+    gender,
+    dob,
+    age_months,
+    county,
+    state,
+    region,
+    reminder_location,
+    immunization_recommendations,
+    mmr2utd,
+    PedVaxHib,
+    Vaxelis,
+    Pediarix,
+    DTaP_Single,
+    IPV_Single,
+    MMR_Single,
+    Prevnar,
+    RotaTeq
+  ) %>%
+
+  arrange(
+    region,
+    county,
+    last_name,
+    first_name
+  )
+
+
+patients_needing_vaccination_file <- file.path(
+  output_dir,
+  paste0(
+    "Palau_Patients_Needing_Vaccination_",
+    today,
+    ".xlsx"
+  )
+)
+
+
+openxlsx::write.xlsx(
+  patients_needing_vaccination,
+  file = patients_needing_vaccination_file,
+  overwrite = TRUE,
+  asTable = TRUE
+)
+
+
+message(
+  "Created patient vaccination-needs file: ",
+  patients_needing_vaccination_file
+)
+```
+
+
+# Palau dashboard handoff
+
+The deidentified Dataset 2 workbook created above is the input expected by
+`R/prepare_data.R`. The Palau dashboard uses
+`data/Palau_State_Population_Area_Density_2020.xlsx` for the 16 county names,
+coordinates, 2020 population, land area, and calculated population density. All
+maps and summaries use county geography only.
+
+#Summary Statistics Tables
+Creates on Excel workbook with the following tables:
+•	IIS denominator by Age
+•	IIS denominator by county
+•	Under-vaccinated by county
+•	Doses needed by county and vaccine
+•	Vaccines needed by county
+•	2–83 months coverage by dose and county
+•	2–83 months UTD by county
+•	19–35 months coverage by county
+•	19–35 months series coverage by county
+
+```{r}
+
+# ==============================================================================
+# Palau CHILD COVERAGE AND OUTREACH TABLES
+# Creates one dated Excel workbook with eight worksheets.
+#
+# Source data: clean12_merged
+# - County is the final county assigned by the county -> clinic -> Koror rule.
+#
+# If your final Palau analytic data frame has a different name, change `palau_source`
+# below and leave the rest of the script unchanged.
+# ==============================================================================
+
+# ---- Packages ----------------------------------------------------------------
+required_packages <- c("dplyr", "tidyr", "stringr", "purrr", "tibble", "openxlsx")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages)
+}
+
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(tibble)
+library(openxlsx)
+
+# ---- Output settings ----------------------------------------------------------
+today <- format(Sys.Date(), "%m%d%y")
+report_year <- format(Sys.Date(), "%Y")
+
+if (!exists("output_dir")) {
+  stop("The object 'output_dir' is not available. Define the output folder before running this section.")
+}
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+output_file <- file.path(
+  output_dir,
+  paste0("Palau_Child_Coverage_Outreach_Tables_", today, ".xlsx")
+)
+
+# Excel worksheet names cannot exceed 31 characters.
+# Names match the attached Palau table shell.
+sheet_names <- c(
+  denominator       = "IIS denominator by County",
+  location_targets  = "Undervaccinated by County",
+  location_vaccine  = "Doses Needed by County",
+  vaccine_products  = "Vaccines Needed by County",
+  dose_coverage     = "2-83 Mos Coverage by County",
+  location_utd      = "2-83 Mos UTD by County",
+  coverage_19_35    = "19-35 Mos Coverage by County",
+  series_19_35      = "19-35 Mos Series by County"
+)
+
+# ---- Validate source data -----------------------------------------------------
+if (!exists("clean12_merged")) {
+  stop("The Palau data frame 'clean12_merged' is not available in the R environment.")
+}
+
+palau_source <- clean12_merged
+
+if (!"county" %in% names(palau_source)) {
+  stop("The variable 'county' is not available in clean12_merged.")
+}
+
+required_vars <- c(
+  # Geography and age
+  "county", "age_months",
+
+  # Outreach targets
+  "onreminder", "need_dtap", "need_ipv", "need_mmr", "need_hib",
+  "need_hepb", "need_pcv", "need_rota",
+
+  # Vaccine products needed
+  "PedVaxHib", "Vaxelis", "Pediarix", "DTaP_Single", "IPV_Single",
+  "MMR_Single", "Prevnar", "RotaTeq",
+
+  # Overall UTD
+  "utd",
+
+  # Dose-specific UTD
+  "dtap1utd", "dtap2utd", "dtap3utd", "dtap4utd", "dtap54utd",
+  "ipv1utd", "ipv2utd", "ipv3utd", "ipv43utd",
+  "mmr1utd", "mmr2utd",
+  "hib1utd", "hib2utd", "hib3utd", "hib4utd", "hib_utd",
+  "hepb1utd", "hepb2utd", "hepb3utd",
+  "pcv1utd", "pcv2utd", "pcv3utd", "pcv4utd", "pcv_utd",
+  "rota3utd",
+
+  # Variables needed for the 19-35 month tables
+  "dob", "hepb_date1", "bcg_date1", "primary_pedvaxhib"
+)
+
+missing_vars <- setdiff(required_vars, names(palau_source))
+
+if (length(missing_vars) > 0) {
+  stop(
+    "The following required variables are missing from clean11_merged: ",
+    paste(missing_vars, collapse = ", ")
+  )
+}
+
+# ---- Cleaning and classification helpers -------------------------------------
+clean_palau_location <- function(x) {
+  x <- standardize_palau_county(x)
+  x[is.na(x)] <- "KOROR"
+  str_to_title(str_to_lower(x))
+}
+
+age_levels <- c(
+  "2 - 3 months",
+  "4 - 5 months",
+  "6 - 11 months",
+  "12 - 18 months",
+  "19 - 35 months",
+  "36 - 47 months",
+  "48 - 59 months",
+  "60 - 71 months",
+  "72 - 83 months"
+)
+
+assign_age_band <- function(age_months) {
+  factor(
+    case_when(
+      age_months >= 2  & age_months <= 3  ~ age_levels[1],
+      age_months >= 4  & age_months <= 5  ~ age_levels[2],
+      age_months >= 6  & age_months <= 11 ~ age_levels[3],
+      age_months >= 12 & age_months <= 18 ~ age_levels[4],
+      age_months >= 19 & age_months <= 35 ~ age_levels[5],
+      age_months >= 36 & age_months <= 47 ~ age_levels[6],
+      age_months >= 48 & age_months <= 59 ~ age_levels[7],
+      age_months >= 60 & age_months <= 71 ~ age_levels[8],
+      age_months >= 72 & age_months <= 83 ~ age_levels[9],
+      TRUE ~ NA_character_
+    ),
+    levels = age_levels
+  )
+}
+
+county_groups <- palau_county_lookup %>%
+  distinct(county) %>%
+  arrange(county) %>%
+  pull(county) %>%
+  str_to_title()
+
+coverage_groups <- c("Palau overall", county_groups)
+
+filter_coverage_group <- function(data, group_name) {
+  if (group_name == "Palau overall") {
+    data
+  } else {
+    data %>% filter(County == group_name)
+  }
+}
+
+fmt_n <- function(x) {
+  format(x, big.mark = ",", scientific = FALSE, trim = TRUE)
+}
+
+# ---- Prepare standardized analysis data --------------------------------------
+analysis_all <- palau_source %>%
+  mutate(
+    County = clean_palau_location(county)
+  )
+
+analysis_2_83 <- analysis_all %>%
+  filter(!is.na(age_months), age_months >= 2, age_months <= 83) %>%
+  mutate(Age_Group = assign_age_band(age_months))
+
+# ==============================================================================
+# TABLE 1: IIS DENOMINATOR BY AGE AND COUNTY
+# ==============================================================================
+denominator_table <- tibble(
+  `Age Group` = c("Active patients (total)", age_levels)
+)
+
+for (group_name in coverage_groups) {
+  group_data <- filter_coverage_group(analysis_2_83, group_name)
+
+  age_counts <- group_data %>%
+    count(Age_Group, name = "n") %>%
+    complete(
+      Age_Group = factor(age_levels, levels = age_levels),
+      fill = list(n = 0)
+    ) %>%
+    arrange(Age_Group)
+
+  denominator_table[[group_name]] <- c(nrow(group_data), age_counts$n)
+}
+
+# ==============================================================================
+# TABLE 2: UNDERVACCINATED CHILDREN BY COUNTY
+# ==============================================================================
+location_targets_table <- analysis_all %>%
+  filter(onreminder == 1) %>%
+  count(County, name = "Undervaccinated Children") %>%
+  complete(
+    County = county_groups,
+    fill = list(`Undervaccinated Children` = 0)
+  ) %>%
+  arrange(County)
+
+# ==============================================================================
+# TABLE 3: UNDERVACCINATED CHILDREN AND DOSES NEEDED BY COUNTY AND VACCINE
+# ==============================================================================
+target_vars <- c(
+  "Total children on reminder/recall" = "onreminder",
+  "DTaP" = "need_dtap",
+  "IPV" = "need_ipv",
+  "MMR" = "need_mmr",
+  "Hib" = "need_hib",
+  "HepB" = "need_hepb",
+  "PCV" = "need_pcv",
+  "Rotavirus" = "need_rota"
+)
+
+location_target_summary <- analysis_all %>%
+  group_by(County) %>%
+  summarise(
+    across(all_of(unname(target_vars)), ~sum(.x, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  rename_with(
+    ~names(target_vars)[match(.x, unname(target_vars))],
+    all_of(unname(target_vars))
+  ) %>%
+  right_join(tibble(County = county_groups), by = "County") %>%
+  mutate(
+    across(all_of(names(target_vars)), ~replace_na(.x, 0))
+  )
+
+palau_target_total <- analysis_all %>%
+  summarise(across(all_of(unname(target_vars)), ~sum(.x, na.rm = TRUE))) %>%
+  rename_with(
+    ~names(target_vars)[match(.x, unname(target_vars))],
+    all_of(unname(target_vars))
+  ) %>%
+  mutate(County = "Palau Total") %>%
+  select(County, everything())
+
+location_vaccine_table <- bind_rows(palau_target_total, location_target_summary) %>%
+  pivot_longer(
+    cols = all_of(names(target_vars)),
+    names_to = "Planning Measure",
+    values_to = "Planning Target"
+  ) %>%
+  mutate(
+    Measure_Order = match(`Planning Measure`, names(target_vars)),
+    Location_Order = if_else(County == "Palau Total", "", County)
+  ) %>%
+  arrange(Location_Order, Measure_Order) %>%
+  select(County, `Planning Measure`, `Planning Target`)
+
+# ==============================================================================
+# TABLE 4: VACCINE PRODUCTS NEEDED BY COUNTY
+# ==============================================================================
+product_vars <- c(
+  "PedVaxHIB" = "PedVaxHib",
+  "Vaxelis" = "Vaxelis",
+  "Pediarix" = "Pediarix",
+  "DTaP single-antigen" = "DTaP_Single",
+  "IPV single-antigen" = "IPV_Single",
+  "MMR single-antigen" = "MMR_Single",
+  "Prevnar" = "Prevnar",
+  "RotaTeq" = "RotaTeq"
+)
+
+location_product_summary <- analysis_all %>%
+  group_by(County) %>%
+  summarise(
+    across(all_of(unname(product_vars)), ~sum(.x, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  rename_with(
+    ~names(product_vars)[match(.x, unname(product_vars))],
+    all_of(unname(product_vars))
+  ) %>%
+  right_join(tibble(County = county_groups), by = "County") %>%
+  mutate(
+    across(all_of(names(product_vars)), ~replace_na(.x, 0))
+  )
+
+palau_product_total <- analysis_all %>%
+  summarise(across(all_of(unname(product_vars)), ~sum(.x, na.rm = TRUE))) %>%
+  rename_with(
+    ~names(product_vars)[match(.x, unname(product_vars))],
+    all_of(unname(product_vars))
+  ) %>%
+  mutate(County = "Palau Total") %>%
+  select(County, everything())
+
+vaccine_products_table <- bind_rows(palau_product_total, location_product_summary) %>%
+  mutate(
+    Location_Order = if_else(County == "Palau Total", "", County)
+  ) %>%
+  arrange(Location_Order) %>%
+  select(-Location_Order)
+
+# ==============================================================================
+# TABLE 5: DOSE-SPECIFIC COVERAGE, AGES 2-83 MONTHS, PALAU AND COUNTIES
+# ==============================================================================
+dose_specs <- tibble(
+  Vaccine = c(
+    rep("DTaP", 5),
+    rep("IPV", 4),
+    rep("MMR", 2),
+    rep("Hib", 3),
+    rep("HepB", 3),
+    rep("PCV", 4)
+  ),
+  Dose = c(
+    paste("Dose", 1:5),
+    paste("Dose", 1:4),
+    paste("Dose", 1:2),
+    paste("Dose", 1:3),
+    paste("Dose", 1:3),
+    paste("Dose", 1:4)
+  ),
+  var = c(
+    "dtap1utd", "dtap2utd", "dtap3utd", "dtap4utd", "dtap54utd",
+    "ipv1utd", "ipv2utd", "ipv3utd", "ipv43utd",
+    "mmr1utd", "mmr2utd",
+    "hib1utd", "hib2utd", "hib3utd",
+    "hepb1utd", "hepb2utd", "hepb3utd",
+    "pcv1utd", "pcv2utd", "pcv3utd", "pcv4utd"
+  ),
+  eligible_age_bands = list(
+    age_levels, age_levels[2:9], age_levels[3:9], age_levels[4:9], age_levels[7:9],
+    age_levels, age_levels[2:9], age_levels[3:9], age_levels[7:9],
+    age_levels[4:9], age_levels[5:9],
+    age_levels, age_levels[2:9], age_levels[3:9],
+    age_levels, age_levels, age_levels[3:9],
+    age_levels, age_levels[2:9], age_levels[3:9], age_levels[4:9]
+  )
+)
+
+calc_coverage_pct <- function(data, group_name, age_band_name, utd_var) {
+  group_data <- filter_coverage_group(data, group_name) %>%
+    filter(Age_Group == age_band_name)
+
+  denominator <- nrow(group_data)
+
+  if (denominator == 0) {
+    return(NA_real_)
+  }
+
+  numerator <- sum(group_data[[utd_var]] == 1, na.rm = TRUE)
+  round((numerator / denominator) * 100, 1)
+}
+
+dose_rows <- vector("list", nrow(dose_specs))
+
+for (i in seq_len(nrow(dose_specs))) {
+  row <- list(
+    Vaccine = dose_specs$Vaccine[i],
+    Dose = dose_specs$Dose[i]
+  )
+
+  for (group_name in coverage_groups) {
+    for (age_band_name in age_levels) {
+      output_col <- paste(group_name, age_band_name, sep = "__")
+
+      if (!age_band_name %in% dose_specs$eligible_age_bands[[i]]) {
+        row[[output_col]] <- "--"
+      } else {
+        pct <- calc_coverage_pct(
+          analysis_2_83,
+          group_name,
+          age_band_name,
+          dose_specs$var[i]
+        )
+
+        row[[output_col]] <- ifelse(is.na(pct), "", sprintf("%.1f", pct))
+      }
+    }
+  }
+
+  dose_rows[[i]] <- as_tibble(row)
+}
+
+dose_coverage_table <- bind_rows(dose_rows)
+
+# ==============================================================================
+# TABLE 6: UTD FOR AGE BY COUNTY, AGES 2-83 MONTHS
+# ==============================================================================
+location_utd_age <- analysis_2_83 %>%
+  group_by(County, Age_Group) %>%
+  summarise(
+    Denominator = n(),
+    UTD_n = sum(utd == 1, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  complete(
+    County = county_groups,
+    Age_Group = factor(age_levels, levels = age_levels),
+    fill = list(Denominator = 0, UTD_n = 0)
+  ) %>%
+  mutate(
+    `% UTD for age` = if_else(
+      Denominator == 0,
+      NA_real_,
+      round((UTD_n / Denominator) * 100, 1)
+    ),
+    Row_Order = as.integer(Age_Group) + 1,
+    `Age Group` = as.character(Age_Group)
+  ) %>%
+  select(County, `Age Group`, Denominator, `% UTD for age`, Row_Order)
+
+location_utd_total <- analysis_2_83 %>%
+  group_by(County) %>%
+  summarise(
+    Denominator = n(),
+    UTD_n = sum(utd == 1, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  right_join(tibble(County = county_groups), by = "County") %>%
+  mutate(
+    Denominator = replace_na(Denominator, 0L),
+    UTD_n = replace_na(UTD_n, 0L)
+  ) %>%
+  mutate(
+    `Age Group` = "Total",
+    `% UTD for age` = if_else(
+      Denominator == 0,
+      NA_real_,
+      round((UTD_n / Denominator) * 100, 1)
+    ),
+    Row_Order = 1L
+  ) %>%
+  select(County, `Age Group`, Denominator, `% UTD for age`, Row_Order)
+
+palau_utd_age <- analysis_2_83 %>%
+  group_by(Age_Group) %>%
+  summarise(
+    Denominator = n(),
+    UTD_n = sum(utd == 1, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  complete(
+    Age_Group = factor(age_levels, levels = age_levels),
+    fill = list(Denominator = 0, UTD_n = 0)
+  ) %>%
+  mutate(
+    County = "Palau Total",
+    `% UTD for age` = if_else(
+      Denominator == 0,
+      NA_real_,
+      round((UTD_n / Denominator) * 100, 1)
+    ),
+    Row_Order = as.integer(Age_Group) + 1,
+    `Age Group` = as.character(Age_Group)
+  ) %>%
+  select(County, `Age Group`, Denominator, `% UTD for age`, Row_Order)
+
+palau_utd_total <- analysis_2_83 %>%
+  summarise(
+    Denominator = n(),
+    UTD_n = sum(utd == 1, na.rm = TRUE)
+  ) %>%
+  mutate(
+    County = "Palau Total",
+    `Age Group` = "Total",
+    `% UTD for age` = if_else(
+      Denominator == 0,
+      NA_real_,
+      round((UTD_n / Denominator) * 100, 1)
+    ),
+    Row_Order = 1L
+  ) %>%
+  select(County, `Age Group`, Denominator, `% UTD for age`, Row_Order)
+
+location_utd_table <- bind_rows(
+  palau_utd_total,
+  palau_utd_age,
+  location_utd_total,
+  location_utd_age
+) %>%
+  mutate(
+    Location_Order = if_else(County == "Palau Total", "", County)
+  ) %>%
+  arrange(Location_Order, Row_Order) %>%
+  select(County, `Age Group`, Denominator, `% UTD for age`)
+
+# ==============================================================================
+# TABLES 7 AND 8: 19-35 MONTH COVERAGE AND SERIES TABLES BY COUNTY
+# ==============================================================================
+palau_19_35 <- analysis_all %>%
+  mutate(
+    hepb_birth_dose = as.integer(
+      !is.na(hepb_date1) & !is.na(dob) &
+        as.numeric(as.Date(hepb_date1) - as.Date(dob)) >= 0 &
+        as.numeric(as.Date(hepb_date1) - as.Date(dob)) <= 3
+    ),
+    bcg_birth_dose = as.integer(
+      !is.na(bcg_date1) & !is.na(dob) &
+        as.numeric(as.Date(bcg_date1) - as.Date(dob)) >= 0 &
+        as.numeric(as.Date(bcg_date1) - as.Date(dob)) <= 3
+    ),
+    hib_primary_series = case_when(
+      primary_pedvaxhib == 1 ~ as.integer(hib2utd == 1),
+      TRUE ~ as.integer(hib3utd == 1)
+    ),
+    hib_full_series = case_when(
+      primary_pedvaxhib == 1 ~ as.integer(hib3utd == 1),
+      TRUE ~ as.integer(hib4utd == 1)
+    ),
+    series432334 = as.integer(
+      dtap4utd == 1 & ipv3utd == 1 & mmr2utd == 1 & hib3utd == 1 &
+        hepb3utd == 1 & pcv4utd == 1
+    ),
+    series431334 = as.integer(
+      dtap4utd == 1 & ipv3utd == 1 & mmr1utd == 1 & hib3utd == 1 &
+        hepb3utd == 1 & pcv4utd == 1
+    ),
+    series432hibutd3pcvutd = as.integer(
+      dtap4utd == 1 & ipv3utd == 1 & mmr2utd == 1 & hib_utd == 1 &
+        hepb3utd == 1 & pcv_utd == 1
+    ),
+    series431hibutd3pcvutd = as.integer(
+      dtap4utd == 1 & ipv3utd == 1 & mmr1utd == 1 & hib_utd == 1 &
+        hepb3utd == 1 & pcv_utd == 1
+    ),
+    series432_hibfull_334 = as.integer(
+      dtap4utd == 1 & ipv3utd == 1 & mmr2utd == 1 & hib_full_series == 1 &
+        hepb3utd == 1 & pcv4utd == 1
+    ),
+    series431_hibfull_334 = as.integer(
+      dtap4utd == 1 & ipv3utd == 1 & mmr1utd == 1 & hib_full_series == 1 &
+        hepb3utd == 1 & pcv4utd == 1
+    ),
+    series432_hibfull_3_pcvutd = as.integer(
+      dtap4utd == 1 & ipv3utd == 1 & mmr2utd == 1 & hib_full_series == 1 &
+        hepb3utd == 1 & pcv_utd == 1
+    ),
+    series431_hibfull_3_pcvutd = as.integer(
+      dtap4utd == 1 & ipv3utd == 1 & mmr1utd == 1 & hib_full_series == 1 &
+        hepb3utd == 1 & pcv_utd == 1
+    )
+  ) %>%
+  filter(age_months >= 19, age_months <= 35)
+
+group_names_19 <- coverage_groups
+
+filter_group_19 <- function(data, group_name) {
+  filter_coverage_group(data, group_name)
+}
+
+make_19_35_display_table <- function(data, row_specs) {
+  output_rows <- vector("list", nrow(row_specs))
+
+  for (i in seq_len(nrow(row_specs))) {
+    this_label <- row_specs$label[i]
+    this_var <- row_specs$var[i]
+    row <- list(label = this_label)
+
+    for (group_name in group_names_19) {
+      group_data <- filter_group_19(data, group_name)
+      n_col <- paste0(group_name, "_n")
+      pct_col <- paste0(group_name, "_pct")
+
+      if (is.na(this_var)) {
+        row[[n_col]] <- NA_real_
+        row[[pct_col]] <- NA_real_
+      } else {
+        denominator <- nrow(group_data)
+        numerator <- if (denominator == 0) {
+          NA_real_
+        } else {
+          sum(group_data[[this_var]] == 1, na.rm = TRUE)
+        }
+
+        row[[n_col]] <- numerator
+        row[[pct_col]] <- if (denominator == 0) {
+          NA_real_
+        } else {
+          round((numerator / denominator) * 100, 1)
+        }
+      }
+    }
+
+    output_rows[[i]] <- as_tibble(row)
+  }
+
+  bind_rows(output_rows)
+}
+
+coverage_rows <- tribble(
+  ~label,                 ~var,
+  "HepB Birth Dose*",     "hepb_birth_dose",
+  "BCG Birth Dose*",      "bcg_birth_dose",
+  ">=3 DTaP",             "dtap3utd",
+  ">=4 DTaP",             "dtap4utd",
+  ">=3 IPV",              "ipv3utd",
+  ">=1 MMR",              "mmr1utd",
+  ">=2 MMR",              "mmr2utd",
+  ">=3 Hib",              "hib3utd",
+  "Hib UTD+",             "hib_utd",
+  "Hib primary series",   "hib_primary_series",
+  "Hib full series",      "hib_full_series",
+  ">=3 HepB",             "hepb3utd",
+  ">=3 PCV",              "pcv3utd",
+  ">=4 PCV",              "pcv4utd",
+  "PCV UTD#",             "pcv_utd",
+  ">=3 Rota",             "rota3utd"
+)
+
+series_rows <- tribble(
+  ~label,                                ~var,
+  "Series",                              NA_character_,
+  "4:3:2:3:3:4*",                        "series432334",
+  "4:3:1:3:3:4+",                        "series431334",
+  "Series with UTD measures",            NA_character_,
+  "4:3:2:Hib UTD:3:PCV UTD#",            "series432hibutd3pcvutd",
+  "4:3:1:Hib UTD:3:PCV UTD^",            "series431hibutd3pcvutd",
+  "Series with Hib series measures",     NA_character_,
+  "4:3:2:Hib full series:3:4**",         "series432_hibfull_334",
+  "4:3:1:Hib full series:3:4++",         "series431_hibfull_334",
+  "4:3:2:Hib full series:3:PCV UTD##",   "series432_hibfull_3_pcvutd",
+  "4:3:1:Hib full series:3:PCV UTD^^",   "series431_hibfull_3_pcvutd"
+)
+
+coverage_19_35_table <- make_19_35_display_table(palau_19_35, coverage_rows)
+series_19_35_table <- make_19_35_display_table(palau_19_35, series_rows)
+
+group_denominators_19 <- map_int(
+  group_names_19,
+  ~nrow(filter_group_19(palau_19_35, .x))
+)
+
+group_display_names_19 <- group_names_19
+
+group_headers_19 <- paste0(
+  group_display_names_19,
+  " (n=", fmt_n(group_denominators_19), ")"
+)
+
+coverage_footnotes <- c(
+  "Abbreviations: Palau=Republic of Palau; HepB=hepatitis B vaccine; BCG=Bacillus Calmette-Guerin vaccine; DTaP=diphtheria and tetanus toxoids and acellular pertussis vaccine; IPV=inactivated poliovirus vaccine; MMR=measles, mumps, and rubella vaccine; Hib=Haemophilus influenzae type b vaccine; UTD=up to date; PCV=pneumococcal conjugate vaccine; Rota=rotavirus vaccine.",
+  "Note: County values use the final assignment hierarchy: valid county, then a county found in clinic name, otherwise Koror.",
+  "*Birth dose is defined as a dose administered 0-3 calendar days after birth.",
+  "+Hib UTD includes children vaccinated according to age-appropriate Hib catch-up guidance.",
+  "#PCV UTD includes children vaccinated according to age-appropriate PCV catch-up guidance."
+)
+
+series_footnotes <- c(
+  "Abbreviations: Palau=Republic of Palau; DTaP=diphtheria and tetanus toxoids and acellular pertussis vaccine; IPV=inactivated poliovirus vaccine; MMR=measles, mumps, and rubella vaccine; Hib=Haemophilus influenzae type b vaccine; HepB=hepatitis B vaccine; PCV=pneumococcal conjugate vaccine; UTD=up to date.",
+  "Hib primary series is receipt of >=2 or >=3 doses, depending on product type. Hib full series is the primary series plus a booster dose. Hib UTD and PCV UTD include age-appropriate catch-up guidance.",
+  "*4:3:2:3:3:4 includes >=4 DTaP, >=3 IPV, >=2 MMR, >=3 Hib, >=3 HepB, and >=4 PCV.",
+  "+4:3:1:3:3:4 includes >=4 DTaP, >=3 IPV, >=1 MMR, >=3 Hib, >=3 HepB, and >=4 PCV.",
+  "#Series includes >=4 DTaP, >=3 IPV, >=2 MMR, Hib UTD, >=3 HepB, and PCV UTD.",
+  "^Series includes >=4 DTaP, >=3 IPV, >=1 MMR, Hib UTD, >=3 HepB, and PCV UTD.",
+  "**Series includes >=4 DTaP, >=3 IPV, >=2 MMR, the Hib full series, >=3 HepB, and >=4 PCV.",
+  "++Series includes >=4 DTaP, >=3 IPV, >=1 MMR, the Hib full series, >=3 HepB, and >=4 PCV.",
+  "##Series includes >=4 DTaP, >=3 IPV, >=2 MMR, the Hib full series, >=3 HepB, and PCV UTD.",
+  "^^Series includes >=4 DTaP, >=3 IPV, >=1 MMR, the Hib full series, >=3 HepB, and PCV UTD."
+)
+
+# ==============================================================================
+# EXCEL FORMATTING HELPERS
+# ==============================================================================
+title_style <- createStyle(
+  textDecoration = "bold",
+  fontSize = 12,
+  halign = "left",
+  valign = "center",
+  wrapText = TRUE
+)
+
+header_style <- createStyle(
+  textDecoration = "bold",
+  halign = "center",
+  valign = "center",
+  wrapText = TRUE,
+  border = "bottom",
+  borderStyle = "thin"
+)
+
+subheader_style <- createStyle(
+  textDecoration = "bold",
+  halign = "center",
+  valign = "center",
+  wrapText = TRUE,
+  border = c("top", "bottom"),
+  borderStyle = "thin"
+)
+
+body_center_style <- createStyle(halign = "center", valign = "center")
+integer_style <- createStyle(halign = "center", numFmt = "#,##0")
+percent_style <- createStyle(halign = "center", numFmt = "0.0")
+bold_style <- createStyle(textDecoration = "bold")
+left_border_style <- createStyle(border = "left", borderStyle = "thin")
+footnote_style <- createStyle(fontSize = 8, wrapText = TRUE, valign = "top")
+
+write_simple_table <- function(
+    wb,
+    sheet,
+    title,
+    data,
+    percent_columns = character(),
+    integer_columns = character()
+) {
+  addWorksheet(wb, sheet, gridLines = TRUE)
+
+  n_cols <- ncol(data)
+  n_rows <- nrow(data)
+  data_start <- 4
+  data_end <- data_start + n_rows - 1
+
+  writeData(wb, sheet, title, startRow = 1, startCol = 1, colNames = FALSE)
+  mergeCells(wb, sheet, cols = 1:n_cols, rows = 1)
+  addStyle(wb, sheet, title_style, rows = 1, cols = 1:n_cols, gridExpand = TRUE)
+
+  writeData(wb, sheet, data, startRow = 3, startCol = 1, colNames = TRUE, keepNA = FALSE)
+  addStyle(wb, sheet, header_style, rows = 3, cols = 1:n_cols, gridExpand = TRUE)
+
+  if (n_rows > 0) {
+    percent_cols <- match(percent_columns, names(data), nomatch = 0)
+    percent_cols <- percent_cols[percent_cols > 0]
+
+    integer_cols <- match(integer_columns, names(data), nomatch = 0)
+    integer_cols <- integer_cols[integer_cols > 0]
+
+    if (length(percent_cols) > 0) {
+      addStyle(
+        wb, sheet, percent_style,
+        rows = data_start:data_end,
+        cols = percent_cols,
+        gridExpand = TRUE
+      )
+    }
+
+    if (length(integer_cols) > 0) {
+      addStyle(
+        wb, sheet, integer_style,
+        rows = data_start:data_end,
+        cols = integer_cols,
+        gridExpand = TRUE
+      )
+    }
+
+    if ("County" %in% names(data)) {
+      total_rows <- which(data[["County"]] == "Palau Total") + data_start - 1
+      if (length(total_rows) > 0) {
+        addStyle(
+          wb, sheet, bold_style,
+          rows = total_rows,
+          cols = 1:n_cols,
+          gridExpand = TRUE,
+          stack = TRUE
+        )
+      }
+    }
+  }
+
+  addFilter(wb, sheet, row = 3, cols = 1:n_cols)
+  freezePane(wb, sheet, firstActiveRow = 4, firstActiveCol = 1)
+  setColWidths(wb, sheet, cols = 1:n_cols, widths = "auto")
+  setRowHeights(wb, sheet, rows = 1, heights = 32)
+}
+
+write_denominator_table <- function(wb, sheet, title, data) {
+  addWorksheet(wb, sheet, gridLines = TRUE)
+
+  n_cols <- ncol(data)
+  data_start <- 4
+  data_end <- data_start + nrow(data) - 1
+
+  writeData(wb, sheet, title, startRow = 1, startCol = 1, colNames = FALSE)
+  mergeCells(wb, sheet, cols = 1:n_cols, rows = 1)
+  addStyle(wb, sheet, title_style, rows = 1, cols = 1:n_cols, gridExpand = TRUE)
+
+  writeData(wb, sheet, "Age Group", startRow = 2, startCol = 1, colNames = FALSE)
+  mergeCells(wb, sheet, cols = 1, rows = 2:3)
+
+  for (i in seq_along(coverage_groups)) {
+    col <- i + 1
+    writeData(wb, sheet, coverage_groups[i], startRow = 2, startCol = col, colNames = FALSE)
+    writeData(wb, sheet, "n", startRow = 3, startCol = col, colNames = FALSE)
+  }
+
+  addStyle(wb, sheet, subheader_style, rows = 2:3, cols = 1:n_cols, gridExpand = TRUE)
+
+  writeData(wb, sheet, data, startRow = data_start, startCol = 1, colNames = FALSE)
+  addStyle(wb, sheet, integer_style, rows = data_start:data_end, cols = 2:n_cols, gridExpand = TRUE)
+  addStyle(wb, sheet, bold_style, rows = data_start, cols = 1:n_cols, gridExpand = TRUE, stack = TRUE)
+
+  setColWidths(wb, sheet, cols = 1, widths = 27)
+  setColWidths(wb, sheet, cols = 2:n_cols, widths = 13)
+  setRowHeights(wb, sheet, rows = 1, heights = 32)
+}
+
+write_dose_coverage_table <- function(wb, sheet, title, data) {
+  addWorksheet(wb, sheet, gridLines = TRUE)
+
+  n_age <- length(age_levels)
+  n_groups <- length(coverage_groups)
+  n_cols <- 2 + (n_age * n_groups)
+  data_start <- 4
+  data_end <- data_start + nrow(data) - 1
+  footnote_row <- data_end + 2
+
+  writeData(wb, sheet, title, startRow = 1, startCol = 1, colNames = FALSE)
+  mergeCells(wb, sheet, cols = 1:n_cols, rows = 1)
+  addStyle(wb, sheet, title_style, rows = 1, cols = 1:n_cols, gridExpand = TRUE)
+
+  writeData(wb, sheet, "Vaccine", startRow = 2, startCol = 1, colNames = FALSE)
+  writeData(wb, sheet, "Dose", startRow = 2, startCol = 2, colNames = FALSE)
+  mergeCells(wb, sheet, cols = 1, rows = 2:3)
+  mergeCells(wb, sheet, cols = 2, rows = 2:3)
+
+  for (i in seq_along(coverage_groups)) {
+    start_col <- 3 + ((i - 1) * n_age)
+    end_col <- start_col + n_age - 1
+
+    writeData(
+      wb, sheet, coverage_groups[i],
+      startRow = 2, startCol = start_col,
+      colNames = FALSE
+    )
+    mergeCells(wb, sheet, cols = start_col:end_col, rows = 2)
+
+    writeData(
+      wb, sheet, matrix(age_levels, nrow = 1),
+      startRow = 3, startCol = start_col,
+      colNames = FALSE, rowNames = FALSE
+    )
+
+    addStyle(
+      wb, sheet, left_border_style,
+      rows = 2:data_end,
+      cols = start_col,
+      gridExpand = TRUE,
+      stack = TRUE
+    )
+  }
+
+  addStyle(wb, sheet, subheader_style, rows = 2:3, cols = 1:n_cols, gridExpand = TRUE)
+
+  write_data <- data
+  write_data$Vaccine[duplicated(write_data$Vaccine)] <- ""
+  writeData(wb, sheet, write_data, startRow = data_start, startCol = 1, colNames = FALSE)
+  addStyle(wb, sheet, body_center_style, rows = data_start:data_end, cols = 2:n_cols, gridExpand = TRUE)
+
+  vaccine_counts <- tibble(
+    Vaccine = unique(dose_specs$Vaccine),
+    n_rows = map_int(unique(dose_specs$Vaccine), ~sum(dose_specs$Vaccine == .x))
+  )
+  current_row <- data_start
+
+  for (i in seq_len(nrow(vaccine_counts))) {
+    block_start <- current_row
+    block_end <- current_row + vaccine_counts$n_rows[i] - 1
+
+    if (block_end > block_start) {
+      mergeCells(wb, sheet, cols = 1, rows = block_start:block_end)
+    }
+
+    addStyle(
+      wb, sheet, bold_style,
+      rows = block_start:block_end,
+      cols = 1,
+      gridExpand = TRUE,
+      stack = TRUE
+    )
+
+    current_row <- block_end + 1
+  }
+
+  writeData(
+    wb, sheet,
+    "Values are percentages. -- indicates that the dose is not expected for that age group.",
+    startRow = footnote_row, startCol = 1, colNames = FALSE
+  )
+  mergeCells(wb, sheet, cols = 1:n_cols, rows = footnote_row)
+  addStyle(wb, sheet, footnote_style, rows = footnote_row, cols = 1:n_cols, gridExpand = TRUE)
+
+  setColWidths(wb, sheet, cols = 1, widths = 11)
+  setColWidths(wb, sheet, cols = 2, widths = 10)
+  setColWidths(wb, sheet, cols = 3:n_cols, widths = 12)
+  setRowHeights(wb, sheet, rows = 1, heights = 32)
+  setRowHeights(wb, sheet, rows = 3, heights = 45)
+  freezePane(wb, sheet, firstActiveRow = 4, firstActiveCol = 3)
+}
+
+write_19_35_table <- function(
+    wb,
+    sheet,
+    title,
+    display_table,
+    row_specs,
+    footnotes
+) {
+  addWorksheet(wb, sheet, gridLines = TRUE)
+
+  n_groups <- length(group_names_19)
+  n_cols <- 1 + (n_groups * 2)
+  data_start <- 4
+  data_end <- data_start + nrow(display_table) - 1
+  foot_start <- data_end + 2
+
+  writeData(wb, sheet, title, startRow = 1, startCol = 1, colNames = FALSE)
+  mergeCells(wb, sheet, cols = 1:n_cols, rows = 1)
+  addStyle(wb, sheet, title_style, rows = 1, cols = 1:n_cols, gridExpand = TRUE)
+
+  writeData(wb, sheet, "Measure", startRow = 2, startCol = 1, colNames = FALSE)
+  mergeCells(wb, sheet, cols = 1, rows = 2:3)
+
+  for (i in seq_along(group_headers_19)) {
+    start_col <- 2 + ((i - 1) * 2)
+
+    writeData(
+      wb, sheet, group_headers_19[i],
+      startRow = 2, startCol = start_col,
+      colNames = FALSE
+    )
+    mergeCells(wb, sheet, cols = start_col:(start_col + 1), rows = 2)
+
+    writeData(
+      wb, sheet, matrix(c("n", "%"), nrow = 1),
+      startRow = 3, startCol = start_col,
+      colNames = FALSE, rowNames = FALSE
+    )
+
+    if (i > 1) {
+      addStyle(
+        wb, sheet, left_border_style,
+        rows = 2:data_end,
+        cols = start_col,
+        gridExpand = TRUE,
+        stack = TRUE
+      )
+    }
+  }
+
+  addStyle(wb, sheet, subheader_style, rows = 2:3, cols = 1:n_cols, gridExpand = TRUE)
+
+  writeData(
+    wb, sheet, display_table,
+    startRow = data_start, startCol = 1,
+    colNames = FALSE, keepNA = FALSE
+  )
+
+  addStyle(wb, sheet, integer_style, rows = data_start:data_end, cols = seq(2, n_cols, by = 2), gridExpand = TRUE)
+  addStyle(wb, sheet, percent_style, rows = data_start:data_end, cols = seq(3, n_cols, by = 2), gridExpand = TRUE)
+
+  section_rows <- which(is.na(row_specs$var)) + data_start - 1
+  if (length(section_rows) > 0) {
+    addStyle(
+      wb, sheet, bold_style,
+      rows = section_rows,
+      cols = 1:n_cols,
+      gridExpand = TRUE,
+      stack = TRUE
+    )
+  }
+
+  for (i in seq_along(footnotes)) {
+    row <- foot_start + i - 1
+    writeData(wb, sheet, footnotes[i], startRow = row, startCol = 1, colNames = FALSE)
+    mergeCells(wb, sheet, cols = 1:n_cols, rows = row)
+    addStyle(wb, sheet, footnote_style, rows = row, cols = 1:n_cols, gridExpand = TRUE)
+  }
+
+  setColWidths(wb, sheet, cols = 1, widths = 35)
+  setColWidths(wb, sheet, cols = 2:n_cols, widths = 10)
+  setRowHeights(wb, sheet, rows = 1, heights = 32)
+  setRowHeights(wb, sheet, rows = 2, heights = 42)
+  freezePane(wb, sheet, firstActiveRow = 4, firstActiveCol = 2)
+}
+
+# ==============================================================================
+# CREATE THE SINGLE WORKBOOK IN THE REQUESTED SHEET ORDER
+# ==============================================================================
+wb <- createWorkbook()
+
+write_denominator_table(
+  wb,
+  sheet_names[["denominator"]],
+  paste0(
+    "Number of children aged 2-83 months with an active status in the ",
+    "immunization information system (IIS), by age group and county - Palau, ",
+    report_year
+  ),
+  denominator_table
+)
+
+write_simple_table(
+  wb,
+  sheet_names[["location_targets"]],
+  paste0(
+    "Number of undervaccinated children on reminder/recall, by county - Palau, ",
+    report_year
+  ),
+  location_targets_table,
+  integer_columns = "Undervaccinated Children"
+)
+
+write_simple_table(
+  wb,
+  sheet_names[["location_vaccine"]],
+  paste0(
+    "Number of undervaccinated children and doses needed, by county and ",
+    "vaccine type - Palau, ", report_year
+  ),
+  location_vaccine_table,
+  integer_columns = "Planning Target"
+)
+
+write_simple_table(
+  wb,
+  sheet_names[["vaccine_products"]],
+  paste0(
+    "Number of vaccine products needed, by county - Palau, ",
+    report_year
+  ),
+  vaccine_products_table,
+  integer_columns = names(product_vars)
+)
+
+write_dose_coverage_table(
+  wb,
+  sheet_names[["dose_coverage"]],
+  paste0(
+    "Percent of children aged 2-83 months UTD for each vaccine dose, ",
+    "by age group and county - Palau, ", report_year
+  ),
+  dose_coverage_table
+)
+
+write_simple_table(
+  wb,
+  sheet_names[["location_utd"]],
+  paste0(
+    "Vaccination up-to-date status among children aged 2-83 months, ",
+    "by county and age group - Palau, ", report_year
+  ),
+  location_utd_table,
+  percent_columns = "% UTD for age",
+  integer_columns = "Denominator"
+)
+
+write_19_35_table(
+  wb,
+  sheet_names[["coverage_19_35"]],
+  paste0(
+    "Vaccination coverage among children aged 19-35 months, ",
+    "by county - Palau, ", report_year
+  ),
+  coverage_19_35_table,
+  coverage_rows,
+  coverage_footnotes
+)
+
+write_19_35_table(
+  wb,
+  sheet_names[["series_19_35"]],
+  paste0(
+    "Vaccine series coverage among children aged 19-35 months, ",
+    "by county - Palau, ", report_year
+  ),
+  series_19_35_table,
+  series_rows,
+  series_footnotes
+)
+
+saveWorkbook(wb, output_file, overwrite = TRUE)
+
+message("Workbook created: ", output_file)
+output_file
+
+```
+
